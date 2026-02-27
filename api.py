@@ -253,7 +253,8 @@ def process_documents():
                 'filename': filename,
                 'file_type': file_ext,
                 'file_size': file_size,
-                'chars_extracted': len(extracted_text)
+                'chars_extracted': len(extracted_text),
+                'preview': extracted_text.strip()[:200]
             })
 
         return jsonify({
