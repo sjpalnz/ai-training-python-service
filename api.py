@@ -13,6 +13,15 @@ CORS(app)  # Allow requests from Supabase
 OUTPUT_DIR = '/tmp/generated_files'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+def get_supabase_client():
+    """Create and return a Supabase client using environment variables"""
+    from supabase import create_client
+    supabase_url = os.environ.get('SUPABASE_URL')
+    supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+    if not supabase_url or not supabase_key:
+        raise Exception('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables required')
+    return create_client(supabase_url, supabase_key)
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -22,106 +31,190 @@ def health_check():
         'timestamp': datetime.now().isoformat()
     })
 
-@app.route('/generate-powerpoint', methods=['POST'])
-def generate_ppt():
+# --- Supabase-integrated endpoints (called by Supabase Edge Functions) ---
+
+@app.route('/generate-powerpoint-from-storyboard', methods=['POST'])
+def generate_ppt_from_storyboard():
     """
-    Generate PowerPoint from course outline
-    
-    Expected JSON:
-    {
-        "title": "Course Title",
-        "slides": [
-            {"number": 1, "type": "title", "content": "..."},
-            {"number": 2, "type": "objectives", "title": "...", "bullets": [...]},
-            ...
-        ]
-    }
+    Fetch storyboard from Supabase, generate real PowerPoint, upload to storage, save to DB.
+    Expected JSON: { "storyboard_id": "uuid" }
     """
     try:
         data = request.json
-        
+        storyboard_id = data.get('storyboard_id')
+
+        if not storyboard_id:
+            return jsonify({'error': 'storyboard_id is required'}), 400
+
+        supabase = get_supabase_client()
+
+        # Fetch storyboard and related course
+        result = supabase.table('storyboards').select('*, courses(*)').eq('id', storyboard_id).single().execute()
+        storyboard = result.data
+
+        if not storyboard:
+            return jsonify({'error': 'Storyboard not found'}), 404
+
+        course_data = storyboard['content_json']
+
+        # Generate PowerPoint file
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"course_{storyboard_id[:8]}_{timestamp}.pptx"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        generate_powerpoint_file(course_data, filepath)
+
+        # Upload to Supabase Storage
+        storage_path = f"powerpoints/{filename}"
+        with open(filepath, 'rb') as f:
+            file_bytes = f.read()
+
+        supabase.storage.from_('course-files').upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={"content-type": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}
+        )
+
+        # Get public URL
+        public_url = supabase.storage.from_('course-files').get_public_url(storage_path)
+
+        # Save to generated_files table
+        file_record = supabase.table('generated_files').insert({
+            'course_id': storyboard['course_id'],
+            'file_type': 'powerpoint',
+            'file_url': public_url,
+            'file_size': len(file_bytes)
+        }).execute()
+
+        # Cleanup local file
+        os.remove(filepath)
+
+        return jsonify({
+            'success': True,
+            'file_id': file_record.data[0]['id'],
+            'download_url': public_url,
+            'filename': filename
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/generate-scorm-from-storyboard', methods=['POST'])
+def generate_scorm_from_storyboard():
+    """
+    Fetch storyboard from Supabase, generate SCORM package, upload to storage, save to DB.
+    Expected JSON: { "storyboard_id": "uuid" }
+    """
+    try:
+        data = request.json
+        storyboard_id = data.get('storyboard_id')
+
+        if not storyboard_id:
+            return jsonify({'error': 'storyboard_id is required'}), 400
+
+        supabase = get_supabase_client()
+
+        # Fetch storyboard and related course
+        result = supabase.table('storyboards').select('*, courses(*)').eq('id', storyboard_id).single().execute()
+        storyboard = result.data
+
+        if not storyboard:
+            return jsonify({'error': 'Storyboard not found'}), 404
+
+        course_data = storyboard['content_json']
+
+        # Generate SCORM package
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"scorm_{storyboard_id[:8]}_{timestamp}.zip"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        generate_scorm_package(course_data, filepath)
+
+        # Upload to Supabase Storage
+        storage_path = f"scorm/{filename}"
+        with open(filepath, 'rb') as f:
+            file_bytes = f.read()
+
+        supabase.storage.from_('course-files').upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={"content-type": "application/zip"}
+        )
+
+        # Get public URL
+        public_url = supabase.storage.from_('course-files').get_public_url(storage_path)
+
+        # Save to generated_files table
+        file_record = supabase.table('generated_files').insert({
+            'course_id': storyboard['course_id'],
+            'file_type': 'scorm',
+            'file_url': public_url,
+            'file_size': len(file_bytes)
+        }).execute()
+
+        # Cleanup local file
+        os.remove(filepath)
+
+        return jsonify({
+            'success': True,
+            'file_id': file_record.data[0]['id'],
+            'download_url': public_url,
+            'filename': filename
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# --- Direct file-return endpoints (kept for local/direct use) ---
+
+@app.route('/generate-powerpoint', methods=['POST'])
+def generate_ppt():
+    """Generate PowerPoint directly and return file (no Supabase)"""
+    try:
+        data = request.json
         if not data or 'slides' not in data:
             return jsonify({'error': 'Missing course outline data'}), 400
-        
-        # Generate unique filename
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"course_{timestamp}.pptx"
         filepath = os.path.join(OUTPUT_DIR, filename)
-        
-        # Call your PowerPoint generation function
         generate_powerpoint_file(data, filepath)
-        
-        # Return file
+
         return send_file(
             filepath,
             mimetype='application/vnd.openxmlformats-officedocument.presentationml.presentation',
             as_attachment=True,
             download_name=filename
         )
-        
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
 @app.route('/generate-scorm', methods=['POST'])
 def generate_scorm():
-    """
-    Generate SCORM package from course outline
-    
-    Expected JSON: Same as PowerPoint
-    """
+    """Generate SCORM package directly and return file (no Supabase)"""
     try:
         data = request.json
-        
         if not data or 'slides' not in data:
             return jsonify({'error': 'Missing course outline data'}), 400
-        
-        # Generate unique filename
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"course_{timestamp}.zip"
         filepath = os.path.join(OUTPUT_DIR, filename)
-        
-        # Call your SCORM generation function
         generate_scorm_package(data, filepath)
-        
-        # Return file
+
         return send_file(
             filepath,
             mimetype='application/zip',
             as_attachment=True,
             download_name=filename
         )
-        
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/generate-pdf-storyboard', methods=['POST'])
-def generate_pdf():
-    """Generate PDF storyboard"""
-    try:
-        data = request.json
-        
-        if not data or 'slides' not in data:
-            return jsonify({'error': 'Missing course outline data'}), 400
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"storyboard_{timestamp}.pdf"
-        filepath = os.path.join(OUTPUT_DIR, filename)
-        
-        # Import and call PDF generation
-        from generate_storyboard import generate_pdf_storyboard
-        generate_pdf_storyboard(data, filepath)
-        
-        return send_file(
-            filepath,
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=filename
-        )
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    # For Railway, read PORT from environment
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
