@@ -165,6 +165,106 @@ def generate_scorm_from_storyboard():
         return jsonify({'error': str(e)}), 500
 
 
+# --- Document upload and text extraction ---
+
+@app.route('/process-documents', methods=['POST'])
+def process_documents():
+    """
+    Accept up to 5 uploaded files, extract text, save to Supabase documents table.
+    Accepts multipart form data with 'files' field and optional 'client_id'.
+    Supports: PDF, DOCX, TXT
+    """
+    try:
+        files = request.files.getlist('files')
+        client_id = request.form.get('client_id', '00000000-0000-0000-0000-000000000001')
+
+        if not files or all(f.filename == '' for f in files):
+            return jsonify({'error': 'No files provided'}), 400
+
+        if len(files) > 5:
+            return jsonify({'error': 'Maximum 5 files allowed'}), 400
+
+        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+        ALLOWED_EXTENSIONS = {'pdf', 'docx', 'doc', 'txt'}
+
+        supabase = get_supabase_client()
+        processed = []
+
+        for file in files:
+            filename = file.filename
+            if not filename:
+                continue
+
+            file_ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+
+            if file_ext not in ALLOWED_EXTENSIONS:
+                return jsonify({'error': f'Unsupported file type: .{file_ext}. Allowed: PDF, DOCX, TXT'}), 400
+
+            # Save to temp location
+            temp_path = os.path.join('/tmp', f"upload_{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}")
+            file.save(temp_path)
+            file_size = os.path.getsize(temp_path)
+
+            if file_size > MAX_FILE_SIZE:
+                os.remove(temp_path)
+                return jsonify({'error': f'{filename} exceeds 10MB limit'}), 400
+
+            # Extract text based on file type
+            extracted_text = ''
+            try:
+                if file_ext == 'pdf':
+                    from pypdf import PdfReader
+                    reader = PdfReader(temp_path)
+                    for page in reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            extracted_text += page_text + '\n'
+
+                elif file_ext in ['docx', 'doc']:
+                    from docx import Document
+                    doc = Document(temp_path)
+                    for para in doc.paragraphs:
+                        if para.text.strip():
+                            extracted_text += para.text + '\n'
+
+                elif file_ext == 'txt':
+                    with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        extracted_text = f.read()
+
+            finally:
+                os.remove(temp_path)
+
+            if not extracted_text.strip():
+                return jsonify({'error': f'Could not extract text from {filename}. File may be empty or image-based.'}), 400
+
+            # Upsert into Supabase documents table
+            drive_file_id = f"upload_{filename}"  # consistent key so re-upload replaces old record
+            supabase.table('documents').upsert({
+                'client_id': client_id,
+                'filename': filename,
+                'file_type': file_ext,
+                'drive_file_id': drive_file_id,
+                'extracted_text': extracted_text,
+                'file_size': file_size
+            }, on_conflict='drive_file_id').execute()
+
+            processed.append({
+                'filename': filename,
+                'file_type': file_ext,
+                'file_size': file_size,
+                'chars_extracted': len(extracted_text)
+            })
+
+        return jsonify({
+            'success': True,
+            'documents_processed': len(processed),
+            'documents': processed
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # --- Direct file-return endpoints (kept for local/direct use) ---
 
 @app.route('/generate-powerpoint', methods=['POST'])
