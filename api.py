@@ -237,16 +237,17 @@ def process_documents():
             if not extracted_text.strip():
                 return jsonify({'error': f'Could not extract text from {filename}. File may be empty or image-based.'}), 400
 
-            # Upsert into Supabase documents table
-            drive_file_id = f"upload_{filename}"  # consistent key so re-upload replaces old record
-            supabase.table('documents').upsert({
+            # Delete existing record for same filename + client, then insert fresh
+            drive_file_id = f"upload_{filename}"
+            supabase.table('documents').delete().eq('client_id', client_id).eq('drive_file_id', drive_file_id).execute()
+            supabase.table('documents').insert({
                 'client_id': client_id,
                 'filename': filename,
                 'file_type': file_ext,
                 'drive_file_id': drive_file_id,
                 'extracted_text': extracted_text,
                 'file_size': file_size
-            }, on_conflict='drive_file_id').execute()
+            }).execute()
 
             processed.append({
                 'filename': filename,
