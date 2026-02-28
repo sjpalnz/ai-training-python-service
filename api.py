@@ -51,11 +51,15 @@ def health_check():
 def generate_ppt_from_storyboard():
     """
     Fetch storyboard from Supabase, generate real PowerPoint, upload to storage, save to DB.
-    Expected JSON: { "storyboard_id": "uuid" }
+    Expected JSON: { "storyboard_id": "uuid", "theme_id": "corporate", "template_url": null }
     """
+    import urllib.request
+    template_tmpfile = None
     try:
         data = request.json
         storyboard_id = data.get('storyboard_id')
+        theme_id      = data.get('theme_id', 'corporate')
+        template_url  = data.get('template_url')   # optional user .pptx template
 
         if not storyboard_id:
             return jsonify({'error': 'storyboard_id is required'}), 400
@@ -71,11 +75,18 @@ def generate_ppt_from_storyboard():
 
         course_data = storyboard['content_json']
 
+        # Download user template if provided
+        template_path = None
+        if template_url:
+            template_tmpfile = os.path.join(OUTPUT_DIR, f"tpl_{storyboard_id[:8]}.pptx")
+            urllib.request.urlretrieve(template_url, template_tmpfile)
+            template_path = template_tmpfile
+
         # Generate PowerPoint file
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"course_{storyboard_id[:8]}_{timestamp}.pptx"
         filepath = os.path.join(OUTPUT_DIR, filename)
-        generate_powerpoint_file(course_data, filepath)
+        generate_powerpoint_file(course_data, filepath, theme_id=theme_id, template_path=template_path)
 
         # Upload to Supabase Storage
         storage_path = f"powerpoints/{filename}"
@@ -99,8 +110,10 @@ def generate_ppt_from_storyboard():
             'file_size': len(file_bytes)
         }).execute()
 
-        # Cleanup local file
+        # Cleanup local files
         os.remove(filepath)
+        if template_tmpfile and os.path.exists(template_tmpfile):
+            os.remove(template_tmpfile)
 
         return jsonify({
             'success': True,
@@ -110,6 +123,8 @@ def generate_ppt_from_storyboard():
         })
 
     except Exception as e:
+        if template_tmpfile and os.path.exists(template_tmpfile):
+            os.remove(template_tmpfile)
         return jsonify({'error': str(e)}), 500
 
 
