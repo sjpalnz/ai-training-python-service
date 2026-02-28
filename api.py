@@ -219,6 +219,29 @@ def generate_scorm_from_storyboard():
 
 # --- Google Drive endpoints ---
 
+@app.route('/check-google-connection', methods=['POST'])
+def check_google_connection():
+    """
+    Check whether a user has Google Drive credentials stored.
+    Expects JSON: { user_id }
+    Returns: { connected: bool }
+    """
+    try:
+        data = request.json or {}
+        user_id = data.get('user_id')
+        if not user_id:
+            return jsonify({'connected': False}), 200
+        supabase = get_supabase_client()
+        creds_row = supabase.table('user_google_credentials') \
+            .select('id') \
+            .eq('user_id', user_id) \
+            .maybeSingle() \
+            .execute()
+        return jsonify({'connected': bool(creds_row.data)})
+    except Exception as e:
+        return jsonify({'connected': False, 'error': str(e)}), 200
+
+
 @app.route('/list-google-drive-files', methods=['POST'])
 def list_google_drive_files():
     """
