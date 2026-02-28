@@ -223,16 +223,26 @@ def generate_scorm_from_storyboard():
 def list_google_drive_files():
     """
     List user's Google Drive files (PDF, DOCX, TXT, Google Docs).
-    Expects JSON: { user_id, refresh_token }
+    Expects JSON: { user_id }
     Returns: { success, files: [{ id, name, mimeType, size, modifiedTime }] }
     """
     try:
         data = request.json or {}
         user_id = data.get('user_id')
-        refresh_token = data.get('refresh_token')
 
-        if not user_id or not refresh_token:
-            return jsonify({'error': 'user_id and refresh_token required'}), 400
+        if not user_id:
+            return jsonify({'error': 'user_id required'}), 400
+
+        # Fetch refresh_token from Supabase using service_role (bypasses RLS)
+        supabase = get_supabase_client()
+        creds_row = supabase.table('user_google_credentials') \
+            .select('refresh_token') \
+            .eq('user_id', user_id) \
+            .single() \
+            .execute()
+        refresh_token = creds_row.data.get('refresh_token') if creds_row.data else None
+        if not refresh_token:
+            return jsonify({'error': 'Google Drive not connected for this user'}), 400
 
         drive_service = build_drive_service(refresh_token)
 
@@ -278,10 +288,20 @@ def process_documents():
         if request.is_json:
             data = request.json or {}
             google_drive_file_id = data.get('google_drive_file_id')
-            refresh_token = data.get('refresh_token')
 
-            if not google_drive_file_id or not refresh_token:
-                return jsonify({'error': 'google_drive_file_id and refresh_token required for Drive import'}), 400
+            if not google_drive_file_id:
+                return jsonify({'error': 'google_drive_file_id required for Drive import'}), 400
+
+            # Fetch refresh_token from Supabase (service_role bypasses RLS)
+            supabase = get_supabase_client()
+            creds_row = supabase.table('user_google_credentials') \
+                .select('refresh_token') \
+                .eq('user_id', user_id) \
+                .single() \
+                .execute()
+            refresh_token = creds_row.data.get('refresh_token') if creds_row.data else None
+            if not refresh_token:
+                return jsonify({'error': 'Google Drive not connected for this user'}), 400
 
             drive_service = build_drive_service(refresh_token)
 
