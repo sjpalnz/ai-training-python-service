@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import json
 import os
+import jwt as pyjwt
 from datetime import datetime
 from generate_powerpoint import generate_powerpoint_file
 from generate_scorm import generate_scorm_package
@@ -12,6 +13,22 @@ CORS(app)  # Allow requests from Supabase
 # Directory for generated files
 OUTPUT_DIR = '/tmp/generated_files'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def verify_jwt(req):
+    """Verify a Supabase-issued JWT and return the user UUID, or None if invalid."""
+    auth_header = req.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return None
+    token = auth_header[7:]
+    secret = os.environ.get('SUPABASE_JWT_SECRET')
+    if not secret:
+        return None
+    try:
+        payload = pyjwt.decode(token, secret, algorithms=['HS256'], audience='authenticated')
+        return payload.get('sub')  # Supabase user UUID
+    except pyjwt.InvalidTokenError:
+        return None
+
 
 def get_supabase_client():
     """Create and return a Supabase client using environment variables"""
@@ -175,8 +192,12 @@ def process_documents():
     Supports: PDF, DOCX, TXT
     """
     try:
+        user_id = verify_jwt(request)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        client_id = user_id
         files = request.files.getlist('files')
-        client_id = request.form.get('client_id', '00000000-0000-0000-0000-000000000001')
 
         if not files or all(f.filename == '' for f in files):
             return jsonify({'error': 'No files provided'}), 400
