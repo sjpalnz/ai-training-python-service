@@ -401,7 +401,7 @@ def process_documents():
                 'source': 'google_drive',
                 'extracted_text': extracted_text,
                 'file_size': file_size or len(file_content)
-            }).select('id').execute()
+            }).execute()
 
             # Deduct 2 credits via RPC
             supabase.rpc('deduct_credits', {
