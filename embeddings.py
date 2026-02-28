@@ -1,31 +1,33 @@
 """
 Embedding utilities for RAG (Retrieval Augmented Generation).
 
-Uses sentence-transformers with all-MiniLM-L6-v2 (384-dimensional vectors,
-~90 MB, fast on CPU, no API key required).
+Uses fastembed with BAAI/bge-small-en-v1.5 (384-dimensional vectors).
+fastembed uses ONNX Runtime instead of PyTorch — the package is ~150 MB
+total vs ~8 GB for sentence-transformers+torch, making it Railway-friendly.
 
-The model is loaded once as a singleton on first use to avoid repeated
-cold-start overhead within the same process.
+The model is loaded once as a singleton on first use.
 """
 
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 _model = None
 
 
-def get_model() -> SentenceTransformer:
+def get_model() -> TextEmbedding:
     """Return the shared embedding model, loading it on first call."""
     global _model
     if _model is None:
-        print("[embeddings] Loading all-MiniLM-L6-v2 …")
-        _model = SentenceTransformer('all-MiniLM-L6-v2')
+        print("[embeddings] Loading BAAI/bge-small-en-v1.5 via fastembed …")
+        _model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
         print("[embeddings] Model ready.")
     return _model
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """Embed a list of strings and return a list of float vectors."""
-    return get_model().encode(texts, convert_to_list=True)
+    model = get_model()
+    # fastembed returns a generator of numpy arrays
+    return [emb.tolist() for emb in model.embed(texts)]
 
 
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> list[str]:
@@ -35,11 +37,11 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> list[str
     Args:
         text:       Input text string.
         chunk_size: Target length of each chunk in characters (~200 tokens).
-        overlap:    Number of characters to repeat between consecutive chunks
-                    so that passages at chunk boundaries are not lost.
+        overlap:    Characters repeated between consecutive chunks so passages
+                    at boundaries are not lost.
 
     Returns:
-        List of chunk strings (non-empty, stripped).
+        List of non-empty stripped chunk strings.
     """
     chunks = []
     start = 0
