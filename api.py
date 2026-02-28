@@ -6,6 +6,29 @@ from datetime import datetime
 from generate_powerpoint import generate_powerpoint_file
 from generate_scorm import generate_scorm_package
 
+
+# ── Google Drive helpers ──────────────────────────────────────────────────────
+
+def get_drive_credentials(refresh_token: str):
+    """Exchange a refresh token for a valid Google Credentials object."""
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri='https://oauth2.googleapis.com/token',
+        client_id=os.environ.get('GOOGLE_OAUTH_CLIENT_ID'),
+        client_secret=os.environ.get('GOOGLE_OAUTH_CLIENT_SECRET')
+    )
+    creds.refresh(Request())
+    return creds
+
+
+def build_drive_service(refresh_token: str):
+    """Return an authenticated Google Drive v3 service."""
+    from googleapiclient.discovery import build
+    return build('drive', 'v3', credentials=get_drive_credentials(refresh_token))
+
 app = Flask(__name__)
 CORS(app)  # Allow requests from Supabase
 
@@ -194,14 +217,55 @@ def generate_scorm_from_storyboard():
         return jsonify({'error': str(e)}), 500
 
 
+# --- Google Drive endpoints ---
+
+@app.route('/list-google-drive-files', methods=['POST'])
+def list_google_drive_files():
+    """
+    List user's Google Drive files (PDF, DOCX, TXT, Google Docs).
+    Expects JSON: { user_id, refresh_token }
+    Returns: { success, files: [{ id, name, mimeType, size, modifiedTime }] }
+    """
+    try:
+        data = request.json or {}
+        user_id = data.get('user_id')
+        refresh_token = data.get('refresh_token')
+
+        if not user_id or not refresh_token:
+            return jsonify({'error': 'user_id and refresh_token required'}), 400
+
+        drive_service = build_drive_service(refresh_token)
+
+        query = (
+            "mimeType = 'application/pdf' or "
+            "mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or "
+            "mimeType = 'application/vnd.google-apps.document' or "
+            "mimeType = 'text/plain'"
+        )
+        results = drive_service.files().list(
+            q=query,
+            spaces='drive',
+            fields='files(id, name, mimeType, size, modifiedTime)',
+            pageSize=50,
+            orderBy='modifiedTime desc'
+        ).execute()
+
+        files = results.get('files', [])
+        return jsonify({'success': True, 'files': files})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # --- Document upload and text extraction ---
 
 @app.route('/process-documents', methods=['POST'])
 def process_documents():
     """
-    Accept up to 5 uploaded files, extract text, save to Supabase documents table.
-    Accepts multipart form data with 'files' field and optional 'client_id'.
-    Supports: PDF, DOCX, TXT
+    Accept uploaded files OR a Google Drive file ID, extract text, save to Supabase.
+    Manual upload: multipart form data with 'files' field.
+    Drive import:  JSON body with 'google_drive_file_id' and 'refresh_token'.
+    Supports: PDF, DOCX, TXT (+ Google Docs exported as DOCX)
     """
     try:
         user_id = verify_jwt(request)
@@ -209,6 +273,122 @@ def process_documents():
             return jsonify({'error': 'Unauthorized'}), 401
 
         client_id = user_id
+
+        # ── Google Drive import path ──────────────────────────────────────────
+        if request.is_json:
+            data = request.json or {}
+            google_drive_file_id = data.get('google_drive_file_id')
+            refresh_token = data.get('refresh_token')
+
+            if not google_drive_file_id or not refresh_token:
+                return jsonify({'error': 'google_drive_file_id and refresh_token required for Drive import'}), 400
+
+            drive_service = build_drive_service(refresh_token)
+
+            # Fetch file metadata
+            file_meta = drive_service.files().get(
+                fileId=google_drive_file_id,
+                fields='name, mimeType, size'
+            ).execute()
+
+            filename = file_meta.get('name', f'drive_{google_drive_file_id}')
+            mime_type = file_meta.get('mimeType', '')
+            file_size = int(file_meta.get('size', 0))
+
+            # Determine file extension + download method
+            from io import BytesIO
+            if mime_type == 'application/vnd.google-apps.document':
+                # Export Google Doc as DOCX
+                file_content = drive_service.files().export_media(
+                    fileId=google_drive_file_id,
+                    mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                ).execute()
+                file_ext = 'docx'
+                if not filename.endswith('.docx'):
+                    filename += '.docx'
+            else:
+                file_content = drive_service.files().get_media(fileId=google_drive_file_id).execute()
+                file_ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+
+            if file_ext not in {'pdf', 'docx', 'doc', 'txt'}:
+                return jsonify({'error': f'Unsupported file type: .{file_ext}'}), 400
+
+            # Write to temp file for text extraction
+            temp_path = os.path.join('/tmp', f"drive_{google_drive_file_id}.{file_ext}")
+            with open(temp_path, 'wb') as f:
+                f.write(file_content)
+
+            extracted_text = ''
+            try:
+                if file_ext == 'pdf':
+                    from pypdf import PdfReader
+                    reader = PdfReader(temp_path)
+                    for page in reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            extracted_text += page_text + '\n'
+                elif file_ext in ['docx', 'doc']:
+                    from docx import Document
+                    doc = Document(temp_path)
+                    for para in doc.paragraphs:
+                        if para.text.strip():
+                            extracted_text += para.text + '\n'
+                elif file_ext == 'txt':
+                    with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        extracted_text = f.read()
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+            if not extracted_text.strip():
+                return jsonify({'error': f'Could not extract text from {filename}. File may be empty or image-based.'}), 400
+
+            supabase = get_supabase_client()
+
+            # Upsert: remove existing Drive record for same file_id, then insert
+            supabase.table('documents').delete().eq('client_id', client_id).eq('drive_file_id', google_drive_file_id).execute()
+            insert_result = supabase.table('documents').insert({
+                'client_id': client_id,
+                'filename': filename,
+                'file_type': file_ext,
+                'drive_file_id': google_drive_file_id,
+                'source': 'google_drive',
+                'extracted_text': extracted_text,
+                'file_size': file_size or len(file_content)
+            }).select('id').execute()
+
+            # Deduct 2 credits via RPC
+            supabase.rpc('deduct_credits', {
+                'p_user_id': client_id,
+                'p_amount': 2,
+                'p_operation': 'google_drive_import',
+                'p_reference_id': None
+            }).execute()
+
+            # RAG chunking (non-fatal)
+            try:
+                from embeddings import embed_texts, chunk_text
+                doc_id = insert_result.data[0]['id']
+                supabase.table('document_chunks').delete().eq('document_id', doc_id).execute()
+                chunks = chunk_text(extracted_text)
+                embeddings = embed_texts(chunks)
+                chunk_rows = [
+                    {'document_id': doc_id, 'client_id': client_id, 'chunk_index': i, 'chunk_text': c, 'embedding': e}
+                    for i, (c, e) in enumerate(zip(chunks, embeddings))
+                ]
+                for batch_start in range(0, len(chunk_rows), 100):
+                    supabase.table('document_chunks').insert(chunk_rows[batch_start:batch_start + 100]).execute()
+                print(f"[RAG] {len(chunks)} chunks indexed for {filename} (Drive)")
+            except Exception as embed_err:
+                print(f"[RAG] Warning: could not index chunks for {filename}: {embed_err}")
+
+            return jsonify({
+                'success': True,
+                'documents_processed': 1,
+                'documents': [{'filename': filename, 'file_type': file_ext, 'chars_extracted': len(extracted_text)}]
+            })
+
+        # ── Manual file upload path (existing code) ───────────────────────────
         files = request.files.getlist('files')
 
         if not files or all(f.filename == '' for f in files):
