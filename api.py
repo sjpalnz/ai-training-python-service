@@ -270,21 +270,24 @@ def list_google_drive_files():
         drive_service = build_drive_service(refresh_token)
 
         query = (
-            "mimeType = 'application/pdf' or "
+            "(mimeType = 'application/pdf' or "
             "mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or "
             "mimeType = 'application/vnd.google-apps.document' or "
-            "mimeType = 'text/plain'"
+            "mimeType = 'text/plain') and "
+            "trashed = false"
         )
         results = drive_service.files().list(
             q=query,
             spaces='drive',
             fields='files(id, name, mimeType, size, modifiedTime)',
             pageSize=50,
-            orderBy='modifiedTime desc'
+            orderBy='modifiedTime desc',
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True
         ).execute()
 
         files = results.get('files', [])
-        return jsonify({'success': True, 'files': files})
+        return jsonify({'success': True, 'files': files, 'debug_count': len(files)})
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
