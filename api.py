@@ -273,14 +273,48 @@ def process_documents():
             # Delete existing record for same filename + client, then insert fresh
             drive_file_id = f"upload_{filename}"
             supabase.table('documents').delete().eq('client_id', client_id).eq('drive_file_id', drive_file_id).execute()
-            supabase.table('documents').insert({
+            insert_result = supabase.table('documents').insert({
                 'client_id': client_id,
                 'filename': filename,
                 'file_type': file_ext,
                 'drive_file_id': drive_file_id,
                 'extracted_text': extracted_text,
                 'file_size': file_size
-            }).execute()
+            }).select('id').execute()
+
+            # ── RAG: chunk + embed the document ──────────────────────────────
+            try:
+                from embeddings import embed_texts, chunk_text
+                doc_id = insert_result.data[0]['id']
+
+                # Remove any stale chunks for this document
+                supabase.table('document_chunks').delete().eq('document_id', doc_id).execute()
+
+                # Split into overlapping passages and generate embeddings
+                chunks = chunk_text(extracted_text)
+                embeddings = embed_texts(chunks)
+
+                chunk_rows = [
+                    {
+                        'document_id': doc_id,
+                        'client_id': client_id,
+                        'chunk_index': i,
+                        'chunk_text': c,
+                        'embedding': e,
+                    }
+                    for i, (c, e) in enumerate(zip(chunks, embeddings))
+                ]
+
+                # Insert in batches of 100 to stay within request size limits
+                for batch_start in range(0, len(chunk_rows), 100):
+                    supabase.table('document_chunks').insert(
+                        chunk_rows[batch_start:batch_start + 100]
+                    ).execute()
+
+                print(f"[RAG] {len(chunks)} chunks indexed for {filename}")
+            except Exception as embed_err:
+                # Non-fatal: Q&A falls back to full-text if chunks are missing
+                print(f"[RAG] Warning: could not index chunks for {filename}: {embed_err}")
 
             processed.append({
                 'filename': filename,
@@ -347,6 +381,49 @@ def generate_scorm():
         )
 
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/search-chunks', methods=['POST'])
+def search_chunks():
+    """
+    Embed a question and return the top-k most semantically similar document chunks.
+
+    Expected JSON:
+      {
+        "question":     str,
+        "client_id":    str (UUID),
+        "document_ids": [str, ...],   # optional filter; empty/omitted = all docs
+        "top_k":        int           # default 8
+      }
+    """
+    try:
+        data         = request.json or {}
+        question     = data.get('question', '').strip()
+        document_ids = data.get('document_ids') or []
+        client_id    = data.get('client_id', '').strip()
+        top_k        = int(data.get('top_k', 8))
+
+        if not question:
+            return jsonify({'error': 'question is required'}), 400
+        if not client_id:
+            return jsonify({'error': 'client_id is required'}), 400
+
+        from embeddings import embed_texts
+        query_embedding = embed_texts([question])[0]
+
+        supabase = get_supabase_client()
+        result = supabase.rpc('match_chunks', {
+            'query_embedding': query_embedding,
+            'match_document_ids': document_ids if document_ids else None,
+            'match_client_id': client_id,
+            'match_count': top_k,
+        }).execute()
+
+        return jsonify({'success': True, 'chunks': result.data or []})
+
+    except Exception as e:
+        print(f"[search-chunks] Error: {e}")
         return jsonify({'error': str(e)}), 500
 
 
