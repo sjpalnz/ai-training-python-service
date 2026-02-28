@@ -247,6 +247,72 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                     size = body_size, color  = text_color,
                 )
 
+        elif slide_type == 'activity':
+            # Activity slide — title, delivery-mode label, duration, instructions
+            activity_type = slide_data.get('activity_type', '')
+            if activity_type == 'face_to_face':
+                mode_label = '👥  FACE-TO-FACE ACTIVITY'
+                mode_color = RGBColor(44, 90, 160)   # blue
+            else:
+                mode_label = '💻  ONLINE ACTIVITY'
+                mode_color = RGBColor(130, 60, 230)  # purple
+
+            # Mode badge (top-left)
+            _add_title_box(
+                slide,
+                text   = mode_label,
+                left   = Inches(0.5), top    = Inches(0.35),
+                width  = Inches(4.5), height = Inches(0.55),
+                size   = Pt(14),      bold   = True,
+                color  = mode_color,
+            )
+
+            # Duration badge (top-right)
+            dur_mins = slide_data.get('duration_minutes')
+            if dur_mins:
+                _add_title_box(
+                    slide,
+                    text   = f'⏱  {dur_mins} min',
+                    left   = Inches(7.5), top    = Inches(0.35),
+                    width  = Inches(2),   height = Inches(0.55),
+                    size   = Pt(13),      bold   = False,
+                    color  = RGBColor(100, 100, 100),
+                    align  = PP_ALIGN.RIGHT,
+                )
+
+            # Activity title
+            _add_title_box(
+                slide,
+                text   = slide_data.get('title', 'Activity'),
+                left   = Inches(0.5), top    = Inches(1.0),
+                width  = Inches(9),   height = Inches(0.9),
+                size   = heading_size, bold  = True,
+                color  = heading_color,
+            )
+
+            # Instructions
+            if slide_data.get('instructions'):
+                _add_title_box(
+                    slide,
+                    text   = slide_data['instructions'],
+                    left   = Inches(0.5), top    = Inches(2.1),
+                    width  = Inches(9),   height = Inches(4.5),
+                    size   = body_size,   bold   = False,
+                    color  = text_color,
+                )
+
+            # Materials list (face-to-face only)
+            if activity_type == 'face_to_face' and slide_data.get('materials'):
+                materials_text = 'Materials: ' + '  •  '.join(slide_data['materials'])
+                _add_title_box(
+                    slide,
+                    text   = materials_text,
+                    left   = Inches(0.5), top    = Inches(6.6),
+                    width  = Inches(9),   height = Inches(0.6),
+                    size   = Pt(13),      bold   = False,
+                    color  = RGBColor(120, 120, 120),
+                )
+
         elif slide_type == 'summary':
             _add_title_box(
                 slide,
