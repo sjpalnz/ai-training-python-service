@@ -245,13 +245,14 @@ def check_google_connection():
 @app.route('/list-google-drive-files', methods=['POST'])
 def list_google_drive_files():
     """
-    List user's Google Drive files (PDF, DOCX, TXT, Google Docs).
-    Expects JSON: { user_id }
-    Returns: { success, files: [{ id, name, mimeType, size, modifiedTime }] }
+    List folders + supported files inside a specific Drive folder.
+    Expects JSON: { user_id, folder_id? }  (folder_id defaults to 'root')
+    Returns: { success, folders: [{id, name}], files: [{id, name, mimeType, size, modifiedTime}] }
     """
     try:
         data = request.json or {}
         user_id = data.get('user_id')
+        folder_id = data.get('folder_id', 'root')
 
         if not user_id:
             return jsonify({'error': 'user_id required'}), 400
@@ -269,25 +270,41 @@ def list_google_drive_files():
 
         drive_service = build_drive_service(refresh_token)
 
-        query = (
+        common_args = dict(
+            spaces='drive',
+            pageSize=100,
+            orderBy='name',
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True
+        )
+
+        # Fetch subfolders in this location
+        folder_results = drive_service.files().list(
+            q=f"'{folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+            fields='files(id, name)',
+            **common_args
+        ).execute()
+
+        # Fetch supported files in this location
+        file_query = (
+            f"'{folder_id}' in parents and "
             "(mimeType = 'application/pdf' or "
             "mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or "
             "mimeType = 'application/vnd.google-apps.document' or "
             "mimeType = 'text/plain') and "
             "trashed = false"
         )
-        results = drive_service.files().list(
-            q=query,
-            spaces='drive',
+        file_results = drive_service.files().list(
+            q=file_query,
             fields='files(id, name, mimeType, size, modifiedTime)',
-            pageSize=50,
-            orderBy='modifiedTime desc',
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True
+            **common_args
         ).execute()
 
-        files = results.get('files', [])
-        return jsonify({'success': True, 'files': files, 'debug_count': len(files)})
+        return jsonify({
+            'success': True,
+            'folders': folder_results.get('files', []),
+            'files': file_results.get('files', [])
+        })
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
