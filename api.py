@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import json
 import os
+import threading
 from datetime import datetime
 from generate_powerpoint import generate_powerpoint_file
 from generate_scorm import generate_scorm_package
@@ -35,6 +36,39 @@ CORS(app)  # Allow requests from Supabase
 # Directory for generated files
 OUTPUT_DIR = '/tmp/generated_files'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def _embed_in_background(doc_id: str, client_id: str, filename: str, extracted_text: str):
+    """Run RAG chunking + embedding in a background thread so the HTTP response
+    is not blocked by the (potentially slow) embedding step."""
+    try:
+        from embeddings import embed_texts, chunk_text
+        supabase = get_supabase_client()
+        supabase.table('document_chunks').delete().eq('document_id', doc_id).execute()
+        chunks = chunk_text(extracted_text)
+        embeddings = embed_texts(chunks)
+        chunk_rows = [
+            {'document_id': doc_id, 'client_id': client_id, 'chunk_index': i,
+             'chunk_text': c, 'embedding': e}
+            for i, (c, e) in enumerate(zip(chunks, embeddings))
+        ]
+        for batch_start in range(0, len(chunk_rows), 100):
+            supabase.table('document_chunks').insert(chunk_rows[batch_start:batch_start + 100]).execute()
+        print(f"[RAG] {len(chunks)} chunks indexed for {filename}")
+    except Exception as embed_err:
+        print(f"[RAG] Warning: could not index chunks for {filename}: {embed_err}")
+
+
+def _prewarm_embedding_model():
+    """Load the fastembed model at startup so the first import request is fast."""
+    try:
+        from embeddings import get_model
+        get_model()
+        print("[startup] Embedding model pre-loaded and ready.")
+    except Exception as e:
+        print(f"[startup] Warning: could not pre-load embedding model: {e}")
+
+threading.Thread(target=_prewarm_embedding_model, daemon=True).start()
 
 def verify_jwt(req):
     """Verify a Supabase-issued JWT via the Supabase auth API and return the user UUID, or None if invalid."""
@@ -428,22 +462,13 @@ def process_documents():
                 'p_reference_id': None
             }).execute()
 
-            # RAG chunking (non-fatal)
-            try:
-                from embeddings import embed_texts, chunk_text
-                doc_id = insert_result.data[0]['id']
-                supabase.table('document_chunks').delete().eq('document_id', doc_id).execute()
-                chunks = chunk_text(extracted_text)
-                embeddings = embed_texts(chunks)
-                chunk_rows = [
-                    {'document_id': doc_id, 'client_id': client_id, 'chunk_index': i, 'chunk_text': c, 'embedding': e}
-                    for i, (c, e) in enumerate(zip(chunks, embeddings))
-                ]
-                for batch_start in range(0, len(chunk_rows), 100):
-                    supabase.table('document_chunks').insert(chunk_rows[batch_start:batch_start + 100]).execute()
-                print(f"[RAG] {len(chunks)} chunks indexed for {filename} (Drive)")
-            except Exception as embed_err:
-                print(f"[RAG] Warning: could not index chunks for {filename}: {embed_err}")
+            # RAG chunking — run in background so HTTP response is not delayed
+            doc_id = insert_result.data[0]['id']
+            threading.Thread(
+                target=_embed_in_background,
+                args=(doc_id, client_id, filename, extracted_text),
+                daemon=True
+            ).start()
 
             return jsonify({
                 'success': True,
