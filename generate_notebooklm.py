@@ -38,7 +38,7 @@ async def _generate_podcast_async(source_text, storyboard_json, output_path):
         try:
             # Add course content as pasted text (truncate to avoid API limits)
             truncated = source_text[:50000]
-            await client.sources.add_text(nb.id, truncated)
+            await client.sources.add_text(nb.id, title, truncated)
 
             # Generate audio podcast
             instructions = (
@@ -75,7 +75,7 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path)
 
         try:
             truncated = source_text[:50000]
-            await client.sources.add_text(nb.id, truncated)
+            await client.sources.add_text(nb.id, title, truncated)
 
             # Generate infographic
             status = await client.artifacts.generate_infographic(nb.id)
