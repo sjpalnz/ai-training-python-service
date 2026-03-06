@@ -113,8 +113,11 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path,
         'STANDARD': InfographicDetail.STANDARD,
         'DETAILED': InfographicDetail.DETAILED,
     }
-    orientation  = ori_map.get(opts.get('orientation', ''), InfographicOrientation.PORTRAIT)
-    detail_level = det_map.get(opts.get('detail', ''),      InfographicDetail.STANDARD)
+    # Only pass explicit values when user chose non-default; otherwise pass None
+    # so the API uses its own defaults (passing PORTRAIT/STANDARD enums can
+    # trigger USER_DISPLAYABLE_ERROR on some account configurations).
+    orientation  = ori_map.get(opts.get('orientation', ''))   # None if not specified
+    detail_level = det_map.get(opts.get('detail', ''))        # None if not specified
     instructions = opts.get('instructions') or None
 
     async with await NotebookLMClient.from_storage() as client:
@@ -133,7 +136,10 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path,
                 orientation=orientation,
                 detail_level=detail_level,
             )
-            print(f"[NotebookLM] generate_infographic returned status: task_id={getattr(status, 'task_id', None)}, status={getattr(status, 'status', None)}")
+            print(f"[NotebookLM] generate_infographic returned status: task_id={getattr(status, 'task_id', None)}, status={getattr(status, 'status', None)}, error={getattr(status, 'error', None)}")
+            # Fast-fail: if the API rejected the request immediately, don't poll
+            if getattr(status, 'is_failed', False) or not getattr(status, 'task_id', None):
+                raise Exception(f'NotebookLM infographic generation rejected: {getattr(status, "error", None) or "no task_id returned"}')
             # Allow up to 15 minutes — infographic generation can be slow
             final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
 
