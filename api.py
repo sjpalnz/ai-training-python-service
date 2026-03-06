@@ -687,6 +687,19 @@ def _notebooklm_job_worker(job_id, storyboard_id, content_type, options=None):
             )
             source_text = f"{course_data.get('title', '')}\n\n{slides_text}"
 
+        # Look up an existing NotebookLM notebook for this course to reuse
+        existing_notebook_id = None
+        prev = supabase.table('generation_jobs') \
+            .select('notebooklm_notebook_id') \
+            .eq('course_id', course_id) \
+            .not_.is_('notebooklm_notebook_id', 'null') \
+            .order('created_at', desc=True) \
+            .limit(1) \
+            .execute()
+        if prev.data:
+            existing_notebook_id = prev.data[0]['notebooklm_notebook_id']
+            print(f"[NotebookLM] Found existing notebook for course {course_id}: {existing_notebook_id}")
+
         # Generate the artifact
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         notebook_id = None
@@ -694,14 +707,14 @@ def _notebooklm_job_worker(job_id, storyboard_id, content_type, options=None):
         if content_type == 'podcast':
             filename = f"podcast_{storyboard_id[:8]}_{timestamp}.mp3"
             filepath = os.path.join(OUTPUT_DIR, filename)
-            notebook_id = generate_podcast(source_text, course_data, filepath, options=options)
+            notebook_id = generate_podcast(source_text, course_data, filepath, options=options, existing_notebook_id=existing_notebook_id)
             storage_path = f"podcasts/{filename}"
             content_type_header = 'audio/mpeg'
             file_type = 'podcast'
         elif content_type == 'video':
             filename = f"video_{storyboard_id[:8]}_{timestamp}.mp4"
             filepath = os.path.join(OUTPUT_DIR, filename)
-            notebook_id = generate_video(source_text, course_data, filepath, options=options)
+            notebook_id = generate_video(source_text, course_data, filepath, options=options, existing_notebook_id=existing_notebook_id)
             storage_path = f"videos/{filename}"
             content_type_header = 'video/mp4'
             file_type = 'video'
@@ -709,7 +722,7 @@ def _notebooklm_job_worker(job_id, storyboard_id, content_type, options=None):
             filename = f"infographic_{storyboard_id[:8]}_{timestamp}.png"
             filepath = os.path.join(OUTPUT_DIR, filename)
             print(f"[NotebookLM] Starting infographic generation with options={options}")
-            notebook_id = generate_infographic(source_text, course_data, filepath, options=options)
+            notebook_id = generate_infographic(source_text, course_data, filepath, options=options, existing_notebook_id=existing_notebook_id)
             storage_path = f"infographics/{filename}"
             content_type_header = 'image/png'
             file_type = 'infographic'

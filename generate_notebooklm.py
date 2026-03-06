@@ -25,8 +25,35 @@ def _get_event_loop():
         return loop
 
 
-async def _generate_podcast_async(source_text, storyboard_json, output_path, options=None):
-    """Create a NotebookLM notebook, add source text, generate podcast, download MP3."""
+async def _get_or_create_notebook_async(client, title, source_text, existing_notebook_id=None):
+    """Return the notebook ID to use for generation.
+
+    If existing_notebook_id is provided and the notebook is still alive,
+    reuse it (adding the source only if it has none yet).  Otherwise create
+    a fresh notebook and add the source text.
+    """
+    if existing_notebook_id:
+        try:
+            await client.notebooks.get(existing_notebook_id)   # raises if deleted
+            sources = await client.sources.list(existing_notebook_id)
+            if sources:
+                print(f"[NotebookLM] Reusing notebook {existing_notebook_id} ({len(sources)} source(s) already present)")
+                return existing_notebook_id
+            # Notebook exists but source was never added — add it now
+            print(f"[NotebookLM] Reusing notebook {existing_notebook_id}, adding source")
+            await client.sources.add_text(existing_notebook_id, title, source_text[:50000], wait=True, wait_timeout=180.0)
+            return existing_notebook_id
+        except Exception as e:
+            print(f"[NotebookLM] Existing notebook {existing_notebook_id} not usable ({e}), creating new one")
+
+    nb = await client.notebooks.create(f"Course: {title}")
+    print(f"[NotebookLM] Created new notebook {nb.id}")
+    await client.sources.add_text(nb.id, title, source_text[:50000], wait=True, wait_timeout=180.0)
+    return nb.id
+
+
+async def _generate_podcast_async(source_text, storyboard_json, output_path, options=None, existing_notebook_id=None):
+    """Create (or reuse) a NotebookLM notebook, generate podcast, download MP3."""
     from notebooklm import NotebookLMClient
     from notebooklm.rpc.types import AudioFormat, AudioLength
 
@@ -56,24 +83,18 @@ async def _generate_podcast_async(source_text, storyboard_json, output_path, opt
     instructions = opts.get('instructions') or default_instructions
 
     async with await NotebookLMClient.from_storage() as client:
-        nb = await client.notebooks.create(f"Course: {title}")
-        notebook_id = nb.id
+        notebook_id = await _get_or_create_notebook_async(client, title, source_text, existing_notebook_id)
 
         try:
-            # Add course content as pasted text — wait=True ensures the source is
-            # fully indexed before we ask NotebookLM to generate anything from it
-            truncated = source_text[:50000]
-            await client.sources.add_text(nb.id, title, truncated, wait=True, wait_timeout=180.0)
-
             # Generate audio podcast
             status = await client.artifacts.generate_audio(
-                nb.id,
+                notebook_id,
                 instructions=instructions,
                 audio_format=audio_format,
                 audio_length=audio_length,
             )
             # Allow up to 15 minutes — audio generation is slow
-            final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
+            final = await client.artifacts.wait_for_completion(notebook_id, status.task_id, timeout=900.0)
 
             # Check if NotebookLM itself reported a failure
             if final.is_failed:
@@ -82,21 +103,17 @@ async def _generate_podcast_async(source_text, storyboard_json, output_path, opt
                 raise Exception(f'NotebookLM audio generation failed: {final.error or "unknown error"}')
 
             # Download the generated audio
-            await client.artifacts.download_audio(nb.id, output_path)
+            await client.artifacts.download_audio(notebook_id, output_path)
 
             return notebook_id
 
         except Exception:
             # NOTE: not deleting notebook on failure — keep it for inspection
-            # try:
-            #     await client.notebooks.delete(nb.id)
-            # except Exception:
-            #     pass
             raise
 
 
-async def _generate_infographic_async(source_text, storyboard_json, output_path, options=None):
-    """Create a NotebookLM notebook, add source text, generate infographic, download PNG."""
+async def _generate_infographic_async(source_text, storyboard_json, output_path, options=None, existing_notebook_id=None):
+    """Create (or reuse) a NotebookLM notebook, generate infographic, download PNG."""
     from notebooklm import NotebookLMClient
     from notebooklm.rpc.types import InfographicOrientation, InfographicDetail
 
@@ -121,17 +138,13 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path,
     instructions = opts.get('instructions') or None
 
     async with await NotebookLMClient.from_storage() as client:
-        nb = await client.notebooks.create(f"Course: {title}")
-        notebook_id = nb.id
+        notebook_id = await _get_or_create_notebook_async(client, title, source_text, existing_notebook_id)
 
         try:
-            truncated = source_text[:50000]
-            await client.sources.add_text(nb.id, title, truncated, wait=True, wait_timeout=180.0)
-
             # Generate infographic
             print(f"[NotebookLM] Calling generate_infographic: notebook={notebook_id}, orientation={orientation}, detail_level={detail_level}, instructions={bool(instructions)}")
             status = await client.artifacts.generate_infographic(
-                nb.id,
+                notebook_id,
                 instructions=instructions,
                 orientation=orientation,
                 detail_level=detail_level,
@@ -141,7 +154,7 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path,
             if getattr(status, 'is_failed', False) or not getattr(status, 'task_id', None):
                 raise Exception(f'NotebookLM infographic generation rejected: {getattr(status, "error", None) or "no task_id returned"}')
             # Allow up to 15 minutes — infographic generation can be slow
-            final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
+            final = await client.artifacts.wait_for_completion(notebook_id, status.task_id, timeout=900.0)
 
             # Check if NotebookLM itself reported a failure
             if final.is_failed:
@@ -150,21 +163,17 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path,
                 raise Exception(f'NotebookLM infographic generation failed: {final.error or "unknown error"}')
 
             # Download the generated infographic
-            await client.artifacts.download_infographic(nb.id, output_path)
+            await client.artifacts.download_infographic(notebook_id, output_path)
 
             return notebook_id
 
         except Exception:
             # NOTE: not deleting notebook on failure — keep it for inspection
-            # try:
-            #     await client.notebooks.delete(nb.id)
-            # except Exception:
-            #     pass
             raise
 
 
-async def _generate_video_async(source_text, storyboard_json, output_path, options=None):
-    """Create a NotebookLM notebook, add source text, generate video, download MP4."""
+async def _generate_video_async(source_text, storyboard_json, output_path, options=None, existing_notebook_id=None):
+    """Create (or reuse) a NotebookLM notebook, generate video, download MP4."""
     from notebooklm import NotebookLMClient
     from notebooklm.rpc.types import VideoFormat, VideoStyle
 
@@ -197,21 +206,17 @@ async def _generate_video_async(source_text, storyboard_json, output_path, optio
     instructions = opts.get('instructions') or default_instructions
 
     async with await NotebookLMClient.from_storage() as client:
-        nb = await client.notebooks.create(f"Course: {title}")
-        notebook_id = nb.id
+        notebook_id = await _get_or_create_notebook_async(client, title, source_text, existing_notebook_id)
 
         try:
-            truncated = source_text[:50000]
-            await client.sources.add_text(nb.id, title, truncated, wait=True, wait_timeout=180.0)
-
             status = await client.artifacts.generate_video(
-                nb.id,
+                notebook_id,
                 instructions=instructions,
                 video_format=video_format,
                 video_style=video_style,
             )
             # Allow up to 30 minutes — video generation is slower than podcast/infographic
-            final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=1800.0)
+            final = await client.artifacts.wait_for_completion(notebook_id, status.task_id, timeout=1800.0)
 
             # Check if NotebookLM itself reported a failure
             if final.is_failed:
@@ -220,16 +225,12 @@ async def _generate_video_async(source_text, storyboard_json, output_path, optio
                 raise Exception(f'NotebookLM video generation failed: {final.error or "unknown error"}')
 
             # Download the generated video
-            await client.artifacts.download_video(nb.id, output_path)
+            await client.artifacts.download_video(notebook_id, output_path)
 
             return notebook_id
 
         except Exception:
             # NOTE: not deleting notebook on failure — keep it for inspection
-            # try:
-            #     await client.notebooks.delete(nb.id)
-            # except Exception:
-            #     pass
             raise
 
 
@@ -252,27 +253,27 @@ async def _check_auth_async():
 
 # ── Public sync wrappers ──────────────────────────────────────────────────────
 
-def generate_podcast(source_text, storyboard_json, output_path, options=None):
+def generate_podcast(source_text, storyboard_json, output_path, options=None, existing_notebook_id=None):
     """Sync wrapper: generate a podcast MP3 from course content."""
     loop = _get_event_loop()
     return loop.run_until_complete(
-        _generate_podcast_async(source_text, storyboard_json, output_path, options)
+        _generate_podcast_async(source_text, storyboard_json, output_path, options, existing_notebook_id)
     )
 
 
-def generate_infographic(source_text, storyboard_json, output_path, options=None):
+def generate_infographic(source_text, storyboard_json, output_path, options=None, existing_notebook_id=None):
     """Sync wrapper: generate an infographic PNG from course content."""
     loop = _get_event_loop()
     return loop.run_until_complete(
-        _generate_infographic_async(source_text, storyboard_json, output_path, options)
+        _generate_infographic_async(source_text, storyboard_json, output_path, options, existing_notebook_id)
     )
 
 
-def generate_video(source_text, storyboard_json, output_path, options=None):
+def generate_video(source_text, storyboard_json, output_path, options=None, existing_notebook_id=None):
     """Sync wrapper: generate a video MP4 from course content."""
     loop = _get_event_loop()
     return loop.run_until_complete(
-        _generate_video_async(source_text, storyboard_json, output_path, options)
+        _generate_video_async(source_text, storyboard_json, output_path, options, existing_notebook_id)
     )
 
 
