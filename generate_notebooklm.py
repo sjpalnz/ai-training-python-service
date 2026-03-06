@@ -87,11 +87,11 @@ async def _generate_podcast_async(source_text, storyboard_json, output_path, opt
             return notebook_id
 
         except Exception:
-            # Attempt cleanup on failure
-            try:
-                await client.notebooks.delete(nb.id)
-            except Exception:
-                pass
+            # NOTE: not deleting notebook on failure — keep it for inspection
+            # try:
+            #     await client.notebooks.delete(nb.id)
+            # except Exception:
+            #     pass
             raise
 
 
@@ -147,10 +147,11 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path,
             return notebook_id
 
         except Exception:
-            try:
-                await client.notebooks.delete(nb.id)
-            except Exception:
-                pass
+            # NOTE: not deleting notebook on failure — keep it for inspection
+            # try:
+            #     await client.notebooks.delete(nb.id)
+            # except Exception:
+            #     pass
             raise
 
 
@@ -216,10 +217,11 @@ async def _generate_video_async(source_text, storyboard_json, output_path, optio
             return notebook_id
 
         except Exception:
-            try:
-                await client.notebooks.delete(nb.id)
-            except Exception:
-                pass
+            # NOTE: not deleting notebook on failure — keep it for inspection
+            # try:
+            #     await client.notebooks.delete(nb.id)
+            # except Exception:
+            #     pass
             raise
 
 

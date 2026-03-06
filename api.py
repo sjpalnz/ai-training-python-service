@@ -746,13 +746,16 @@ def _notebooklm_job_worker(job_id, storyboard_id, content_type, options=None):
             'updated_at': datetime.now().isoformat()
         }).eq('id', job_id).execute()
 
-        # Cleanup
+        # Cleanup local temp file
         os.remove(filepath)
-        if notebook_id:
-            try:
-                cleanup_notebook(notebook_id)
-            except Exception as e:
-                print(f"[NotebookLM] Warning: cleanup failed for notebook {notebook_id}: {e}")
+        # NOTE: intentionally not deleting the NotebookLM notebook so the
+        # notebook and its studio assets (audio, infographic, video) remain
+        # visible in NotebookLM for inspection.
+        # if notebook_id:
+        #     try:
+        #         cleanup_notebook(notebook_id)
+        #     except Exception as e:
+        #         print(f"[NotebookLM] Warning: cleanup failed for notebook {notebook_id}: {e}")
 
         print(f"[NotebookLM] {file_type} generated successfully: {filename}")
 
