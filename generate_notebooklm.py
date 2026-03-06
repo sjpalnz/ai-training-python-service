@@ -25,11 +25,35 @@ def _get_event_loop():
         return loop
 
 
-async def _generate_podcast_async(source_text, storyboard_json, output_path):
+async def _generate_podcast_async(source_text, storyboard_json, output_path, options=None):
     """Create a NotebookLM notebook, add source text, generate podcast, download MP3."""
     from notebooklm import NotebookLMClient
+    from notebooklm.rpc.types import AudioFormat, AudioLength
 
+    opts = options or {}
     title = storyboard_json.get('title', 'Course Content')
+
+    # Map string values from frontend to enums
+    fmt_map = {
+        'DEEP_DIVE': AudioFormat.DEEP_DIVE,
+        'BRIEF':     AudioFormat.BRIEF,
+        'CRITIQUE':  AudioFormat.CRITIQUE,
+        'DEBATE':    AudioFormat.DEBATE,
+    }
+    len_map = {
+        'SHORT':   AudioLength.SHORT,
+        'DEFAULT': AudioLength.DEFAULT,
+        'LONG':    AudioLength.LONG,
+    }
+    audio_format = fmt_map.get(opts.get('format', ''), AudioFormat.DEEP_DIVE)
+    audio_length = len_map.get(opts.get('length', ''), AudioLength.DEFAULT)
+
+    default_instructions = (
+        f"Create an engaging educational podcast about '{title}'. "
+        "Make it conversational and suitable for learning. "
+        "Cover the key concepts thoroughly."
+    )
+    instructions = opts.get('instructions') or default_instructions
 
     async with await NotebookLMClient.from_storage() as client:
         nb = await client.notebooks.create(f"Course: {title}")
@@ -42,12 +66,12 @@ async def _generate_podcast_async(source_text, storyboard_json, output_path):
             await client.sources.add_text(nb.id, title, truncated, wait=True, wait_timeout=180.0)
 
             # Generate audio podcast
-            instructions = (
-                f"Create an engaging educational podcast about '{title}'. "
-                "Make it conversational and suitable for learning. "
-                "Cover the key concepts thoroughly."
+            status = await client.artifacts.generate_audio(
+                nb.id,
+                instructions=instructions,
+                audio_format=audio_format,
+                audio_length=audio_length,
             )
-            status = await client.artifacts.generate_audio(nb.id, instructions=instructions)
             # Allow up to 15 minutes — audio generation is slow
             final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
 
@@ -71,11 +95,27 @@ async def _generate_podcast_async(source_text, storyboard_json, output_path):
             raise
 
 
-async def _generate_infographic_async(source_text, storyboard_json, output_path):
+async def _generate_infographic_async(source_text, storyboard_json, output_path, options=None):
     """Create a NotebookLM notebook, add source text, generate infographic, download PNG."""
     from notebooklm import NotebookLMClient
+    from notebooklm.rpc.types import InfographicOrientation, InfographicDetail
 
+    opts = options or {}
     title = storyboard_json.get('title', 'Course Content')
+
+    ori_map = {
+        'LANDSCAPE': InfographicOrientation.LANDSCAPE,
+        'PORTRAIT':  InfographicOrientation.PORTRAIT,
+        'SQUARE':    InfographicOrientation.SQUARE,
+    }
+    det_map = {
+        'CONCISE':  InfographicDetail.CONCISE,
+        'STANDARD': InfographicDetail.STANDARD,
+        'DETAILED': InfographicDetail.DETAILED,
+    }
+    orientation  = ori_map.get(opts.get('orientation', ''), InfographicOrientation.PORTRAIT)
+    detail_level = det_map.get(opts.get('detail', ''),      InfographicDetail.STANDARD)
+    instructions = opts.get('instructions') or None
 
     async with await NotebookLMClient.from_storage() as client:
         nb = await client.notebooks.create(f"Course: {title}")
@@ -86,7 +126,12 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path)
             await client.sources.add_text(nb.id, title, truncated, wait=True, wait_timeout=180.0)
 
             # Generate infographic
-            status = await client.artifacts.generate_infographic(nb.id)
+            status = await client.artifacts.generate_infographic(
+                nb.id,
+                instructions=instructions,
+                orientation=orientation,
+                detail_level=detail_level,
+            )
             # Allow up to 15 minutes — infographic generation can be slow
             final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
 
@@ -109,12 +154,38 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path)
             raise
 
 
-async def _generate_video_async(source_text, storyboard_json, output_path):
+async def _generate_video_async(source_text, storyboard_json, output_path, options=None):
     """Create a NotebookLM notebook, add source text, generate video, download MP4."""
     from notebooklm import NotebookLMClient
-    from notebooklm.rpc.types import VideoFormat
+    from notebooklm.rpc.types import VideoFormat, VideoStyle
 
+    opts = options or {}
     title = storyboard_json.get('title', 'Course Content')
+
+    fmt_map = {
+        'EXPLAINER': VideoFormat.EXPLAINER,
+        'BRIEF':     VideoFormat.BRIEF,
+    }
+    sty_map = {
+        'AUTO_SELECT': VideoStyle.AUTO_SELECT,
+        'WHITEBOARD':  VideoStyle.WHITEBOARD,
+        'CLASSIC':     VideoStyle.CLASSIC,
+        'KAWAII':      VideoStyle.KAWAII,
+        'ANIME':       VideoStyle.ANIME,
+        'WATERCOLOR':  VideoStyle.WATERCOLOR,
+        'RETRO_PRINT': VideoStyle.RETRO_PRINT,
+        'HERITAGE':    VideoStyle.HERITAGE,
+        'PAPER_CRAFT': VideoStyle.PAPER_CRAFT,
+    }
+    video_format = fmt_map.get(opts.get('format', ''), VideoFormat.EXPLAINER)
+    video_style  = sty_map.get(opts.get('style', ''),  VideoStyle.AUTO_SELECT)
+
+    default_instructions = (
+        f"Create an engaging educational video overview of '{title}'. "
+        "Make it clear, informative, and suitable for learning. "
+        "Cover the key concepts thoroughly."
+    )
+    instructions = opts.get('instructions') or default_instructions
 
     async with await NotebookLMClient.from_storage() as client:
         nb = await client.notebooks.create(f"Course: {title}")
@@ -124,15 +195,11 @@ async def _generate_video_async(source_text, storyboard_json, output_path):
             truncated = source_text[:50000]
             await client.sources.add_text(nb.id, title, truncated, wait=True, wait_timeout=180.0)
 
-            instructions = (
-                f"Create an engaging educational video overview of '{title}'. "
-                "Make it clear, informative, and suitable for learning. "
-                "Cover the key concepts thoroughly."
-            )
             status = await client.artifacts.generate_video(
                 nb.id,
                 instructions=instructions,
-                video_format=VideoFormat.EXPLAINER,
+                video_format=video_format,
+                video_style=video_style,
             )
             # Allow up to 30 minutes — video generation is slower than podcast/infographic
             final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=1800.0)
@@ -175,27 +242,27 @@ async def _check_auth_async():
 
 # ── Public sync wrappers ──────────────────────────────────────────────────────
 
-def generate_podcast(source_text, storyboard_json, output_path):
+def generate_podcast(source_text, storyboard_json, output_path, options=None):
     """Sync wrapper: generate a podcast MP3 from course content."""
     loop = _get_event_loop()
     return loop.run_until_complete(
-        _generate_podcast_async(source_text, storyboard_json, output_path)
+        _generate_podcast_async(source_text, storyboard_json, output_path, options)
     )
 
 
-def generate_infographic(source_text, storyboard_json, output_path):
+def generate_infographic(source_text, storyboard_json, output_path, options=None):
     """Sync wrapper: generate an infographic PNG from course content."""
     loop = _get_event_loop()
     return loop.run_until_complete(
-        _generate_infographic_async(source_text, storyboard_json, output_path)
+        _generate_infographic_async(source_text, storyboard_json, output_path, options)
     )
 
 
-def generate_video(source_text, storyboard_json, output_path):
+def generate_video(source_text, storyboard_json, output_path, options=None):
     """Sync wrapper: generate a video MP4 from course content."""
     loop = _get_event_loop()
     return loop.run_until_complete(
-        _generate_video_async(source_text, storyboard_json, output_path)
+        _generate_video_async(source_text, storyboard_json, output_path, options)
     )
 
 

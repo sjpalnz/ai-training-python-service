@@ -652,7 +652,7 @@ def process_documents():
 
 # --- NotebookLM content generation (podcast / infographic) ---
 
-def _notebooklm_job_worker(job_id, storyboard_id, content_type):
+def _notebooklm_job_worker(job_id, storyboard_id, content_type, options=None):
     """Background worker: generate NotebookLM content and update job status."""
     try:
         from generate_notebooklm import generate_podcast, generate_infographic, generate_video, cleanup_notebook
@@ -694,21 +694,21 @@ def _notebooklm_job_worker(job_id, storyboard_id, content_type):
         if content_type == 'podcast':
             filename = f"podcast_{storyboard_id[:8]}_{timestamp}.mp3"
             filepath = os.path.join(OUTPUT_DIR, filename)
-            notebook_id = generate_podcast(source_text, course_data, filepath)
+            notebook_id = generate_podcast(source_text, course_data, filepath, options=options)
             storage_path = f"podcasts/{filename}"
             content_type_header = 'audio/mpeg'
             file_type = 'podcast'
         elif content_type == 'video':
             filename = f"video_{storyboard_id[:8]}_{timestamp}.mp4"
             filepath = os.path.join(OUTPUT_DIR, filename)
-            notebook_id = generate_video(source_text, course_data, filepath)
+            notebook_id = generate_video(source_text, course_data, filepath, options=options)
             storage_path = f"videos/{filename}"
             content_type_header = 'video/mp4'
             file_type = 'video'
         else:
             filename = f"infographic_{storyboard_id[:8]}_{timestamp}.png"
             filepath = os.path.join(OUTPUT_DIR, filename)
-            notebook_id = generate_infographic(source_text, course_data, filepath)
+            notebook_id = generate_infographic(source_text, course_data, filepath, options=options)
             storage_path = f"infographics/{filename}"
             content_type_header = 'image/png'
             file_type = 'infographic'
@@ -780,6 +780,7 @@ def generate_notebooklm_content():
         data = request.json or {}
         storyboard_id = data.get('storyboard_id')
         content_type = data.get('content_type')
+        options = data.get('options', {})
 
         if not storyboard_id:
             return jsonify({'error': 'storyboard_id is required'}), 400
@@ -804,7 +805,7 @@ def generate_notebooklm_content():
         # Spawn background worker
         threading.Thread(
             target=_notebooklm_job_worker,
-            args=(job_id, storyboard_id, content_type),
+            args=(job_id, storyboard_id, content_type, options),
             daemon=True
         ).start()
 
