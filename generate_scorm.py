@@ -3,27 +3,29 @@ import zipfile
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
-def generate_scorm_package(course_data, output_path):
+def generate_scorm_package(course_data, output_path, podcast_url=None, infographic_url=None):
     """
     Generate SCORM 1.2 package from course outline
-    
+
     Args:
-        course_data: Dict with 'title' and 'slides' array
-        output_path: Path where .zip file will be saved
+        course_data:      Dict with 'title' and 'slides' array
+        output_path:      Path where .zip file will be saved
+        podcast_url:      Optional public URL to an MP3 podcast to embed as audio player
+        infographic_url:  Optional public URL to a PNG infographic to embed as image
     """
     # Create temp directory for SCORM files
     temp_dir = '/tmp/scorm_temp'
     os.makedirs(temp_dir, exist_ok=True)
-    
+
     course_title = course_data.get('title', 'Training Course')
-    
+
     # Generate imsmanifest.xml
     manifest_content = generate_manifest(course_data)
     with open(os.path.join(temp_dir, 'imsmanifest.xml'), 'w') as f:
         f.write(manifest_content)
-    
+
     # Generate index.html
-    html_content = generate_html(course_data)
+    html_content = generate_html(course_data, podcast_url=podcast_url, infographic_url=infographic_url)
     with open(os.path.join(temp_dir, 'index.html'), 'w') as f:
         f.write(html_content)
     
@@ -97,7 +99,7 @@ def generate_manifest(course_data):
     reparsed = minidom.parseString(rough_string)
     return reparsed.toprettyxml(indent='  ')
 
-def generate_html(course_data):
+def generate_html(course_data, podcast_url=None, infographic_url=None):
     """Generate HTML content for SCORM package"""
     course_title = course_data.get('title', 'Training Course')
     slides = course_data.get('slides', [])
@@ -203,6 +205,25 @@ def generate_html(course_data):
         
         html += '        </div>\n'
     
+    if podcast_url:
+        html += f'''        <div class="slide" style="background: #e8f5e9;">
+            <div class="slide-title">Course Podcast</div>
+            <p>Listen to an AI-generated discussion of the course content:</p>
+            <audio controls style="width: 100%; margin-top: 15px;">
+                <source src="{podcast_url}" type="audio/mpeg">
+                Your browser does not support the audio element.
+            </audio>
+        </div>
+'''
+
+    if infographic_url:
+        html += f'''        <div class="slide">
+            <div class="slide-title">Course Infographic</div>
+            <img src="{infographic_url}" alt="Course Infographic"
+                 style="max-width: 100%; height: auto; border-radius: 8px; margin-top: 10px;" />
+        </div>
+'''
+
     html += '''        <button onclick="completeCourse()">Complete Course</button>
     </div>
     

@@ -112,6 +112,7 @@ def generate_ppt_from_storyboard():
     """
     import urllib.request
     template_tmpfile = None
+    infographic_tmpfile = None
     try:
         data = request.json
         storyboard_id = data.get('storyboard_id')
@@ -139,11 +140,28 @@ def generate_ppt_from_storyboard():
             urllib.request.urlretrieve(template_url, template_tmpfile)
             template_path = template_tmpfile
 
+        # Check for existing infographic to embed
+        infographic_tmpfile = None
+        try:
+            infographic_result = supabase.table('generated_files') \
+                .select('file_url') \
+                .eq('course_id', storyboard['course_id']) \
+                .eq('file_type', 'infographic') \
+                .order('created_at', desc=True) \
+                .limit(1) \
+                .execute()
+            if infographic_result.data:
+                infographic_tmpfile = os.path.join(OUTPUT_DIR, f"infographic_{storyboard_id[:8]}.png")
+                urllib.request.urlretrieve(infographic_result.data[0]['file_url'], infographic_tmpfile)
+        except Exception as e:
+            print(f"[PPT] Warning: could not fetch infographic for embedding: {e}")
+            infographic_tmpfile = None
+
         # Generate PowerPoint file
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"course_{storyboard_id[:8]}_{timestamp}.pptx"
         filepath = os.path.join(OUTPUT_DIR, filename)
-        generate_powerpoint_file(course_data, filepath, theme_id=theme_id, template_path=template_path)
+        generate_powerpoint_file(course_data, filepath, theme_id=theme_id, template_path=template_path, infographic_path=infographic_tmpfile)
 
         # Upload to Supabase Storage
         storage_path = f"powerpoints/{filename}"
@@ -171,6 +189,8 @@ def generate_ppt_from_storyboard():
         os.remove(filepath)
         if template_tmpfile and os.path.exists(template_tmpfile):
             os.remove(template_tmpfile)
+        if infographic_tmpfile and os.path.exists(infographic_tmpfile):
+            os.remove(infographic_tmpfile)
 
         return jsonify({
             'success': True,
@@ -182,6 +202,8 @@ def generate_ppt_from_storyboard():
     except Exception as e:
         if template_tmpfile and os.path.exists(template_tmpfile):
             os.remove(template_tmpfile)
+        if infographic_tmpfile and os.path.exists(infographic_tmpfile):
+            os.remove(infographic_tmpfile)
         return jsonify({'error': str(e)}), 500
 
 
@@ -209,11 +231,37 @@ def generate_scorm_from_storyboard():
 
         course_data = storyboard['content_json']
 
+        # Check for existing podcast and infographic to embed
+        podcast_url = None
+        infographic_url = None
+        try:
+            podcast_result = supabase.table('generated_files') \
+                .select('file_url') \
+                .eq('course_id', storyboard['course_id']) \
+                .eq('file_type', 'podcast') \
+                .order('created_at', desc=True) \
+                .limit(1) \
+                .execute()
+            if podcast_result.data:
+                podcast_url = podcast_result.data[0]['file_url']
+
+            infographic_result = supabase.table('generated_files') \
+                .select('file_url') \
+                .eq('course_id', storyboard['course_id']) \
+                .eq('file_type', 'infographic') \
+                .order('created_at', desc=True) \
+                .limit(1) \
+                .execute()
+            if infographic_result.data:
+                infographic_url = infographic_result.data[0]['file_url']
+        except Exception as e:
+            print(f"[SCORM] Warning: could not fetch media for embedding: {e}")
+
         # Generate SCORM package
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"scorm_{storyboard_id[:8]}_{timestamp}.zip"
         filepath = os.path.join(OUTPUT_DIR, filename)
-        generate_scorm_package(course_data, filepath)
+        generate_scorm_package(course_data, filepath, podcast_url=podcast_url, infographic_url=infographic_url)
 
         # Upload to Supabase Storage
         storage_path = f"scorm/{filename}"
@@ -600,6 +648,220 @@ def process_documents():
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# --- NotebookLM content generation (podcast / infographic) ---
+
+def _notebooklm_job_worker(job_id, storyboard_id, content_type):
+    """Background worker: generate NotebookLM content and update job status."""
+    try:
+        from generate_notebooklm import generate_podcast, generate_infographic, cleanup_notebook
+        supabase = get_supabase_client()
+
+        # Update job → processing
+        supabase.table('generation_jobs').update({
+            'status': 'processing',
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        # Fetch storyboard + course data
+        sb_result = supabase.table('storyboards').select('*, courses(*)').eq('id', storyboard_id).single().execute()
+        storyboard = sb_result.data
+        if not storyboard:
+            raise Exception('Storyboard not found')
+
+        course_data = storyboard['content_json']
+        course_id = storyboard['course_id']
+        client_id = storyboard['courses']['client_id']
+
+        # Gather source document text
+        docs_result = supabase.table('documents').select('extracted_text').eq('client_id', client_id).limit(10).execute()
+        source_text = '\n\n'.join(
+            doc['extracted_text'][:5000] for doc in (docs_result.data or []) if doc.get('extracted_text')
+        )
+        # Fall back to storyboard content if no docs
+        if not source_text.strip():
+            slides_text = '\n'.join(
+                f"{s.get('title', '')}: {' '.join(s.get('bullets', []))}"
+                for s in course_data.get('slides', [])
+            )
+            source_text = f"{course_data.get('title', '')}\n\n{slides_text}"
+
+        # Generate the artifact
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        notebook_id = None
+
+        if content_type == 'podcast':
+            filename = f"podcast_{storyboard_id[:8]}_{timestamp}.mp3"
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            notebook_id = generate_podcast(source_text, course_data, filepath)
+            storage_path = f"podcasts/{filename}"
+            content_type_header = 'audio/mpeg'
+            file_type = 'podcast'
+        else:
+            filename = f"infographic_{storyboard_id[:8]}_{timestamp}.png"
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            notebook_id = generate_infographic(source_text, course_data, filepath)
+            storage_path = f"infographics/{filename}"
+            content_type_header = 'image/png'
+            file_type = 'infographic'
+
+        # Update notebook ID for tracking
+        supabase.table('generation_jobs').update({
+            'notebooklm_notebook_id': notebook_id,
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        # Upload to Supabase Storage
+        with open(filepath, 'rb') as f:
+            file_bytes = f.read()
+
+        supabase.storage.from_('course-files').upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={"content-type": content_type_header}
+        )
+
+        public_url = supabase.storage.from_('course-files').get_public_url(storage_path)
+
+        # Save to generated_files table
+        file_record = supabase.table('generated_files').insert({
+            'course_id': course_id,
+            'file_type': file_type,
+            'file_url': public_url,
+            'file_size': len(file_bytes)
+        }).execute()
+
+        # Update job → completed
+        supabase.table('generation_jobs').update({
+            'status': 'completed',
+            'result_file_id': file_record.data[0]['id'],
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        # Cleanup
+        os.remove(filepath)
+        if notebook_id:
+            try:
+                cleanup_notebook(notebook_id)
+            except Exception as e:
+                print(f"[NotebookLM] Warning: cleanup failed for notebook {notebook_id}: {e}")
+
+        print(f"[NotebookLM] {file_type} generated successfully: {filename}")
+
+    except Exception as err:
+        print(f"[NotebookLM] Job {job_id} failed: {err}")
+        try:
+            supabase = get_supabase_client()
+            supabase.table('generation_jobs').update({
+                'status': 'failed',
+                'error_message': str(err)[:500],
+                'updated_at': datetime.now().isoformat()
+            }).eq('id', job_id).execute()
+        except Exception:
+            pass
+
+
+@app.route('/generate-notebooklm-content', methods=['POST'])
+def generate_notebooklm_content():
+    """
+    Start async generation of a podcast or infographic via NotebookLM.
+    Expected JSON: { "storyboard_id": "uuid", "content_type": "podcast"|"infographic" }
+    Returns: { "job_id": "uuid" } immediately; poll /job-status/<job_id> for result.
+    """
+    try:
+        data = request.json or {}
+        storyboard_id = data.get('storyboard_id')
+        content_type = data.get('content_type')
+
+        if not storyboard_id:
+            return jsonify({'error': 'storyboard_id is required'}), 400
+        if content_type not in ('podcast', 'infographic'):
+            return jsonify({'error': 'content_type must be "podcast" or "infographic"'}), 400
+
+        # Look up course_id from the storyboard
+        supabase = get_supabase_client()
+        sb = supabase.table('storyboards').select('course_id').eq('id', storyboard_id).single().execute()
+        if not sb.data:
+            return jsonify({'error': 'Storyboard not found'}), 404
+
+        # Create job row
+        job = supabase.table('generation_jobs').insert({
+            'course_id': sb.data['course_id'],
+            'job_type': content_type,
+            'status': 'pending'
+        }).execute()
+
+        job_id = job.data[0]['id']
+
+        # Spawn background worker
+        threading.Thread(
+            target=_notebooklm_job_worker,
+            args=(job_id, storyboard_id, content_type),
+            daemon=True
+        ).start()
+
+        return jsonify({'success': True, 'job_id': job_id})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/job-status/<job_id>', methods=['GET'])
+def job_status(job_id):
+    """
+    Poll the status of a NotebookLM generation job.
+    Returns: { "status": "pending"|"processing"|"completed"|"failed",
+               "file_url": "...", "error_message": "..." }
+    """
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table('generation_jobs') \
+            .select('status, error_message, result_file_id') \
+            .eq('id', job_id) \
+            .single() \
+            .execute()
+
+        if not result.data:
+            return jsonify({'error': 'Job not found'}), 404
+
+        job = result.data
+        response = {'status': job['status']}
+
+        if job['status'] == 'completed' and job.get('result_file_id'):
+            file_result = supabase.table('generated_files') \
+                .select('file_url') \
+                .eq('id', job['result_file_id']) \
+                .single() \
+                .execute()
+            if file_result.data:
+                response['file_url'] = file_result.data['file_url']
+
+        if job.get('error_message'):
+            response['error_message'] = job['error_message']
+
+        return jsonify(response)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/notebooklm-status', methods=['GET'])
+def notebooklm_status():
+    """
+    Health check for NotebookLM auth.
+    Returns: { "available": true|false, "error": "..." }
+    """
+    auth_json = os.environ.get('NOTEBOOKLM_AUTH_JSON')
+    if not auth_json:
+        return jsonify({'available': False, 'error': 'NOTEBOOKLM_AUTH_JSON not configured'})
+
+    try:
+        from generate_notebooklm import check_auth
+        check_auth()
+        return jsonify({'available': True})
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)})
 
 
 # --- Direct file-return endpoints (kept for local/direct use) ---

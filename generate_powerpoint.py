@@ -1,3 +1,4 @@
+import os
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN
@@ -116,18 +117,19 @@ def _add_bullets(slide, bullets, left, top, width, height, size, color):
 
 # ── Main generator ─────────────────────────────────────────────────────────────
 
-def generate_powerpoint_file(course_data, output_path, theme_id='corporate', template_path=None):
+def generate_powerpoint_file(course_data, output_path, theme_id='corporate', template_path=None, infographic_path=None):
     """
     Generate a PowerPoint from a course outline dict.
 
     Args:
-        course_data:   Dict with 'title' and 'slides' array.
-        output_path:   Destination .pptx path.
-        theme_id:      One of 'corporate', 'dark', 'slate', 'clean', 'vibrant'.
-        template_path: Optional path to a user-supplied .pptx template.  When
-                       provided the template's slide master (background, fonts,
-                       theme colours) is preserved; we skip setting a background
-                       colour so the template's own design shows through.
+        course_data:      Dict with 'title' and 'slides' array.
+        output_path:      Destination .pptx path.
+        theme_id:         One of 'corporate', 'dark', 'slate', 'clean', 'vibrant'.
+        template_path:    Optional path to a user-supplied .pptx template.  When
+                          provided the template's slide master (background, fonts,
+                          theme colours) is preserved; we skip setting a background
+                          colour so the template's own design shows through.
+        infographic_path: Optional path to a PNG infographic to embed as a slide.
     """
     theme = THEMES.get(theme_id, THEMES['corporate'])
 
@@ -349,6 +351,24 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                     size   = body_size,   bold   = False,
                     color  = text_color,
                 )
+
+    # ── Optional infographic slide at the end ────────────────────────────────
+    if infographic_path and os.path.exists(infographic_path):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        set_slide_bg(slide, slide_bg)
+        _add_title_box(
+            slide,
+            text   = 'Course Infographic',
+            left   = Inches(0.5), top    = Inches(0.3),
+            width  = Inches(9),   height = Inches(0.6),
+            size   = Pt(24),      bold   = True,
+            color  = heading_color, align = PP_ALIGN.CENTER,
+        )
+        slide.shapes.add_picture(
+            infographic_path,
+            left  = Inches(0.5), top    = Inches(1.0),
+            width = Inches(9),   height = Inches(6.0),
+        )
 
     prs.save(output_path)
     return output_path
