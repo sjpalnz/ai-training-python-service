@@ -36,9 +36,10 @@ async def _generate_podcast_async(source_text, storyboard_json, output_path):
         notebook_id = nb.id
 
         try:
-            # Add course content as pasted text (truncate to avoid API limits)
+            # Add course content as pasted text — wait=True ensures the source is
+            # fully indexed before we ask NotebookLM to generate anything from it
             truncated = source_text[:50000]
-            await client.sources.add_text(nb.id, title, truncated)
+            await client.sources.add_text(nb.id, title, truncated, wait=True, wait_timeout=180.0)
 
             # Generate audio podcast
             instructions = (
@@ -47,7 +48,8 @@ async def _generate_podcast_async(source_text, storyboard_json, output_path):
                 "Cover the key concepts thoroughly."
             )
             status = await client.artifacts.generate_audio(nb.id, instructions=instructions)
-            await client.artifacts.wait_for_completion(nb.id, status.task_id)
+            # Allow up to 15 minutes — audio generation is slow
+            await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
 
             # Download the generated audio
             await client.artifacts.download_audio(nb.id, output_path)
@@ -75,11 +77,12 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path)
 
         try:
             truncated = source_text[:50000]
-            await client.sources.add_text(nb.id, title, truncated)
+            await client.sources.add_text(nb.id, title, truncated, wait=True, wait_timeout=180.0)
 
             # Generate infographic
             status = await client.artifacts.generate_infographic(nb.id)
-            await client.artifacts.wait_for_completion(nb.id, status.task_id)
+            # Allow up to 15 minutes — infographic generation can be slow
+            await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
 
             # Download the generated infographic
             await client.artifacts.download_infographic(nb.id, output_path)
