@@ -134,8 +134,8 @@ async def _generate_video_async(source_text, storyboard_json, output_path):
                 instructions=instructions,
                 video_format=VideoFormat.EXPLAINER,
             )
-            # Allow up to 15 minutes — video generation can be slow
-            final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
+            # Allow up to 30 minutes — video generation is slower than podcast/infographic
+            final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=1800.0)
 
             # Check if NotebookLM itself reported a failure
             if final.is_failed:
