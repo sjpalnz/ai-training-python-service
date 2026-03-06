@@ -126,12 +126,14 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path,
             await client.sources.add_text(nb.id, title, truncated, wait=True, wait_timeout=180.0)
 
             # Generate infographic
+            print(f"[NotebookLM] Calling generate_infographic: notebook={notebook_id}, orientation={orientation}, detail_level={detail_level}, instructions={bool(instructions)}")
             status = await client.artifacts.generate_infographic(
                 nb.id,
                 instructions=instructions,
                 orientation=orientation,
                 detail_level=detail_level,
             )
+            print(f"[NotebookLM] generate_infographic returned status: task_id={getattr(status, 'task_id', None)}, status={getattr(status, 'status', None)}")
             # Allow up to 15 minutes — infographic generation can be slow
             final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
 

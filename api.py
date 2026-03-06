@@ -708,6 +708,7 @@ def _notebooklm_job_worker(job_id, storyboard_id, content_type, options=None):
         else:
             filename = f"infographic_{storyboard_id[:8]}_{timestamp}.png"
             filepath = os.path.join(OUTPUT_DIR, filename)
+            print(f"[NotebookLM] Starting infographic generation with options={options}")
             notebook_id = generate_infographic(source_text, course_data, filepath, options=options)
             storage_path = f"infographics/{filename}"
             content_type_header = 'image/png'
@@ -760,7 +761,9 @@ def _notebooklm_job_worker(job_id, storyboard_id, content_type, options=None):
         print(f"[NotebookLM] {file_type} generated successfully: {filename}")
 
     except Exception as err:
+        import traceback
         print(f"[NotebookLM] Job {job_id} failed: {err}")
+        print(f"[NotebookLM] Traceback:\n{traceback.format_exc()}")
         try:
             supabase = get_supabase_client()
             supabase.table('generation_jobs').update({
