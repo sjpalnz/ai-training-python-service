@@ -109,6 +109,53 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path)
             raise
 
 
+async def _generate_video_async(source_text, storyboard_json, output_path):
+    """Create a NotebookLM notebook, add source text, generate video, download MP4."""
+    from notebooklm import NotebookLMClient
+    from notebooklm.rpc.types import VideoFormat
+
+    title = storyboard_json.get('title', 'Course Content')
+
+    async with await NotebookLMClient.from_storage() as client:
+        nb = await client.notebooks.create(f"Course: {title}")
+        notebook_id = nb.id
+
+        try:
+            truncated = source_text[:50000]
+            await client.sources.add_text(nb.id, title, truncated, wait=True, wait_timeout=180.0)
+
+            instructions = (
+                f"Create an engaging educational video overview of '{title}'. "
+                "Make it clear, informative, and suitable for learning. "
+                "Cover the key concepts thoroughly."
+            )
+            status = await client.artifacts.generate_video(
+                nb.id,
+                instructions=instructions,
+                video_format=VideoFormat.EXPLAINER,
+            )
+            # Allow up to 15 minutes — video generation can be slow
+            final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
+
+            # Check if NotebookLM itself reported a failure
+            if final.is_failed:
+                if final.is_rate_limited:
+                    raise Exception('NotebookLM rate limit exceeded — please try again later')
+                raise Exception(f'NotebookLM video generation failed: {final.error or "unknown error"}')
+
+            # Download the generated video
+            await client.artifacts.download_video(nb.id, output_path)
+
+            return notebook_id
+
+        except Exception:
+            try:
+                await client.notebooks.delete(nb.id)
+            except Exception:
+                pass
+            raise
+
+
 async def _cleanup_notebook_async(notebook_id):
     """Delete a temporary NotebookLM notebook."""
     from notebooklm import NotebookLMClient
@@ -141,6 +188,14 @@ def generate_infographic(source_text, storyboard_json, output_path):
     loop = _get_event_loop()
     return loop.run_until_complete(
         _generate_infographic_async(source_text, storyboard_json, output_path)
+    )
+
+
+def generate_video(source_text, storyboard_json, output_path):
+    """Sync wrapper: generate a video MP4 from course content."""
+    loop = _get_event_loop()
+    return loop.run_until_complete(
+        _generate_video_async(source_text, storyboard_json, output_path)
     )
 
 

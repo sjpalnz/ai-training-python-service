@@ -655,7 +655,7 @@ def process_documents():
 def _notebooklm_job_worker(job_id, storyboard_id, content_type):
     """Background worker: generate NotebookLM content and update job status."""
     try:
-        from generate_notebooklm import generate_podcast, generate_infographic, cleanup_notebook
+        from generate_notebooklm import generate_podcast, generate_infographic, generate_video, cleanup_notebook
         supabase = get_supabase_client()
 
         # Update job → processing
@@ -698,6 +698,13 @@ def _notebooklm_job_worker(job_id, storyboard_id, content_type):
             storage_path = f"podcasts/{filename}"
             content_type_header = 'audio/mpeg'
             file_type = 'podcast'
+        elif content_type == 'video':
+            filename = f"video_{storyboard_id[:8]}_{timestamp}.mp4"
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            notebook_id = generate_video(source_text, course_data, filepath)
+            storage_path = f"videos/{filename}"
+            content_type_header = 'video/mp4'
+            file_type = 'video'
         else:
             filename = f"infographic_{storyboard_id[:8]}_{timestamp}.png"
             filepath = os.path.join(OUTPUT_DIR, filename)
@@ -776,8 +783,8 @@ def generate_notebooklm_content():
 
         if not storyboard_id:
             return jsonify({'error': 'storyboard_id is required'}), 400
-        if content_type not in ('podcast', 'infographic'):
-            return jsonify({'error': 'content_type must be "podcast" or "infographic"'}), 400
+        if content_type not in ('podcast', 'infographic', 'video'):
+            return jsonify({'error': 'content_type must be "podcast", "infographic", or "video"'}), 400
 
         # Look up course_id from the storyboard
         supabase = get_supabase_client()
