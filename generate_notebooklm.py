@@ -49,7 +49,13 @@ async def _generate_podcast_async(source_text, storyboard_json, output_path):
             )
             status = await client.artifacts.generate_audio(nb.id, instructions=instructions)
             # Allow up to 15 minutes — audio generation is slow
-            await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
+            final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
+
+            # Check if NotebookLM itself reported a failure
+            if final.is_failed:
+                if final.is_rate_limited:
+                    raise Exception('NotebookLM rate limit exceeded — please try again later')
+                raise Exception(f'NotebookLM audio generation failed: {final.error or "unknown error"}')
 
             # Download the generated audio
             await client.artifacts.download_audio(nb.id, output_path)
@@ -82,7 +88,13 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path)
             # Generate infographic
             status = await client.artifacts.generate_infographic(nb.id)
             # Allow up to 15 minutes — infographic generation can be slow
-            await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
+            final = await client.artifacts.wait_for_completion(nb.id, status.task_id, timeout=900.0)
+
+            # Check if NotebookLM itself reported a failure
+            if final.is_failed:
+                if final.is_rate_limited:
+                    raise Exception('NotebookLM rate limit exceeded — please try again later')
+                raise Exception(f'NotebookLM infographic generation failed: {final.error or "unknown error"}')
 
             # Download the generated infographic
             await client.artifacts.download_infographic(nb.id, output_path)
