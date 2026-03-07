@@ -1041,41 +1041,19 @@ def search_chunks():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/reindex-documents', methods=['POST'])
-def reindex_documents():
-    """
-    Re-chunk and re-embed all existing documents for a user.
-    Use this to backfill document_chunks for documents uploaded before RAG was enabled.
-
-    Expected JSON:
-      {
-        "client_id": str (UUID)
-      }
-
-    Returns progress per document: how many chunks were created or any errors.
-    """
+def _reindex_worker(client_id):
+    """Background thread: chunk + embed all documents for a user."""
     try:
-        data      = request.json or {}
-        client_id = data.get('client_id', '').strip()
-
-        if not client_id:
-            return jsonify({'error': 'client_id is required'}), 400
-
         from embeddings import embed_texts, chunk_text
         supabase = get_supabase_client()
 
-        # Fetch all documents for this user that have extracted text
         result = supabase.table('documents') \
             .select('id, filename, extracted_text') \
             .eq('client_id', client_id) \
             .execute()
 
         documents = result.data or []
-        if not documents:
-            return jsonify({'success': True, 'message': 'No documents found', 'indexed': 0})
-
-        indexed = []
-        errors  = []
+        print(f"[reindex] Starting reindex for {client_id}: {len(documents)} documents")
 
         for doc in documents:
             doc_id         = doc['id']
@@ -1083,14 +1061,12 @@ def reindex_documents():
             extracted_text = doc.get('extracted_text') or ''
 
             if not extracted_text.strip():
-                errors.append({'filename': filename, 'error': 'No extracted text — skipped'})
+                print(f"[reindex] Skipping {filename} — no extracted text")
                 continue
 
             try:
-                # Remove any stale chunks for this document
                 supabase.table('document_chunks').delete().eq('document_id', doc_id).execute()
 
-                # Chunk and embed
                 chunks     = chunk_text(extracted_text)
                 embeddings = embed_texts(chunks)
 
@@ -1105,25 +1081,46 @@ def reindex_documents():
                     for i, (c, e) in enumerate(zip(chunks, embeddings))
                 ]
 
-                # Insert in batches of 100
                 for batch_start in range(0, len(chunk_rows), 100):
                     supabase.table('document_chunks').insert(
                         chunk_rows[batch_start:batch_start + 100]
                     ).execute()
 
-                print(f"[reindex] {len(chunks)} chunks indexed for {filename}")
-                indexed.append({'filename': filename, 'chunks': len(chunks)})
+                print(f"[reindex] ✓ {filename}: {len(chunks)} chunks")
 
             except Exception as doc_err:
-                print(f"[reindex] Error indexing {filename}: {doc_err}")
-                errors.append({'filename': filename, 'error': str(doc_err)})
+                print(f"[reindex] ✗ {filename}: {doc_err}")
+
+        print(f"[reindex] Done for {client_id}")
+
+    except Exception as e:
+        print(f"[reindex] Fatal error: {e}")
+
+
+@app.route('/reindex-documents', methods=['POST'])
+def reindex_documents():
+    """
+    Re-chunk and re-embed all existing documents for a user.
+    Runs in a background thread and returns immediately — check Railway logs for progress.
+
+    Expected JSON: { "client_id": str (UUID) }
+    """
+    try:
+        data      = request.json or {}
+        client_id = data.get('client_id', '').strip()
+
+        if not client_id:
+            return jsonify({'error': 'client_id is required'}), 400
+
+        # Kick off background thread and return immediately (avoids Railway timeout)
+        import threading
+        t = threading.Thread(target=_reindex_worker, args=(client_id,), daemon=True)
+        t.start()
 
         return jsonify({
             'success': True,
-            'documents_processed': len(indexed),
-            'documents_failed':    len(errors),
-            'indexed':             indexed,
-            'errors':              errors,
+            'message': 'Reindexing started in background. Check Railway logs for progress.',
+            'client_id': client_id,
         })
 
     except Exception as e:
