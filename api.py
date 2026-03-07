@@ -102,6 +102,63 @@ def health_check():
         'timestamp': datetime.now().isoformat()
     })
 
+# --- Extract text from uploaded PowerPoint ---
+
+@app.route('/extract-pptx-text', methods=['POST'])
+def extract_pptx_text():
+    """Extract structured slide text from an uploaded .pptx file."""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file provided'}), 400
+
+        file = request.files['file']
+        if not file.filename.lower().endswith('.pptx'):
+            return jsonify({'success': False, 'error': 'File must be a .pptx file'}), 400
+
+        from pptx import Presentation
+        import io
+
+        prs = Presentation(io.BytesIO(file.read()))
+        slides = []
+
+        for idx, slide in enumerate(prs.slides, 1):
+            title_text = ''
+            body_text_parts = []
+
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    text = shape.text_frame.text.strip()
+                    if not text:
+                        continue
+                    # First text shape with content is usually the title
+                    if not title_text and (shape.shape_id == slide.shapes.title.shape_id if slide.shapes.title else False):
+                        title_text = text
+                    elif not title_text and idx == 1:
+                        title_text = text
+                    else:
+                        body_text_parts.append(text)
+
+            # Fallback: if no title found, use first body text
+            if not title_text and body_text_parts:
+                title_text = body_text_parts.pop(0)
+
+            slides.append({
+                'number': idx,
+                'title': title_text,
+                'text': '\n'.join(body_text_parts)
+            })
+
+        return jsonify({
+            'success': True,
+            'slides': slides,
+            'filename': file.filename,
+            'slide_count': len(slides)
+        })
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # --- Supabase-integrated endpoints (called by Supabase Edge Functions) ---
 
 @app.route('/generate-powerpoint-from-storyboard', methods=['POST'])
