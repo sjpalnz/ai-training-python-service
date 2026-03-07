@@ -1043,6 +1043,7 @@ def search_chunks():
 
 def _reindex_worker(client_id):
     """Background thread: chunk + embed all documents for a user."""
+    import gc
     try:
         from embeddings import embed_texts, chunk_text
         supabase = get_supabase_client()
@@ -1067,8 +1068,15 @@ def _reindex_worker(client_id):
             try:
                 supabase.table('document_chunks').delete().eq('document_id', doc_id).execute()
 
-                chunks     = chunk_text(extracted_text)
-                embeddings = embed_texts(chunks)
+                chunks = chunk_text(extracted_text)
+
+                # Embed in small batches of 20 to avoid OOM spikes on Railway
+                EMBED_BATCH = 20
+                all_embeddings = []
+                for b in range(0, len(chunks), EMBED_BATCH):
+                    batch_embs = embed_texts(chunks[b:b + EMBED_BATCH])
+                    all_embeddings.extend(batch_embs)
+                    gc.collect()  # free intermediate tensors between batches
 
                 chunk_rows = [
                     {
@@ -1078,18 +1086,22 @@ def _reindex_worker(client_id):
                         'chunk_text':  c,
                         'embedding':   e,
                     }
-                    for i, (c, e) in enumerate(zip(chunks, embeddings))
+                    for i, (c, e) in enumerate(zip(chunks, all_embeddings))
                 ]
 
-                for batch_start in range(0, len(chunk_rows), 100):
+                # Insert in batches of 50 (smaller payload to Supabase)
+                for batch_start in range(0, len(chunk_rows), 50):
                     supabase.table('document_chunks').insert(
-                        chunk_rows[batch_start:batch_start + 100]
+                        chunk_rows[batch_start:batch_start + 50]
                     ).execute()
 
                 print(f"[reindex] ✓ {filename}: {len(chunks)} chunks")
 
             except Exception as doc_err:
                 print(f"[reindex] ✗ {filename}: {doc_err}")
+
+            finally:
+                gc.collect()  # free memory between documents
 
         print(f"[reindex] Done for {client_id}")
 
