@@ -1,9 +1,10 @@
 """
-NotebookLM integration for generating podcasts and infographics via notebooklm-py.
+NotebookLM integration for generating podcasts, infographics, videos, and
+slide decks via notebooklm-py.
 
 This module wraps the notebooklm-py library to create temporary notebooks,
-add course content as sources, generate audio/infographic artifacts, and
-download the results. Temporary notebooks are cleaned up after generation.
+add course content as sources, generate audio/infographic/video/slide-deck
+artifacts, and download the results.
 
 Requires NOTEBOOKLM_AUTH_JSON env var with Google session state.
 """
@@ -234,6 +235,81 @@ async def _generate_video_async(source_text, storyboard_json, output_path, optio
             raise
 
 
+def _pdf_to_images(pdf_path, output_dir):
+    """Convert each page of a PDF to a PNG image. Returns list of image file paths."""
+    from pdf2image import convert_from_path
+    images = convert_from_path(pdf_path, dpi=200, fmt='png')
+    paths = []
+    for i, img in enumerate(images):
+        img_path = os.path.join(output_dir, f'slide_{i+1}.png')
+        img.save(img_path, 'PNG')
+        paths.append(img_path)
+    return paths
+
+
+async def _generate_slide_deck_async(source_text, title, output_dir, options=None, existing_notebook_id=None):
+    """Create (or reuse) a NotebookLM notebook, generate slide deck, download PDF + PPTX + per-slide PNGs."""
+    from notebooklm import NotebookLMClient
+    from notebooklm.rpc.types import SlideDeckFormat, SlideDeckLength
+
+    opts = options or {}
+
+    fmt_map = {
+        'DETAILED_DECK':    SlideDeckFormat.DETAILED_DECK,
+        'PRESENTER_SLIDES': SlideDeckFormat.PRESENTER_SLIDES,
+    }
+    len_map = {
+        'DEFAULT': SlideDeckLength.DEFAULT,
+        'SHORT':   SlideDeckLength.SHORT,
+    }
+    slide_format = fmt_map.get(opts.get('slide_format', ''))
+    slide_length = len_map.get(opts.get('slide_length', ''))
+    instructions = opts.get('instructions') or None
+
+    async with await NotebookLMClient.from_storage() as client:
+        notebook_id = await _get_or_create_notebook_async(client, title, source_text, existing_notebook_id)
+
+        try:
+            print(f"[NotebookLM] Generating slide deck: notebook={notebook_id}, format={slide_format}, length={slide_length}")
+            status = await client.artifacts.generate_slide_deck(
+                notebook_id,
+                instructions=instructions,
+                slide_format=slide_format,
+                slide_length=slide_length,
+            )
+            if getattr(status, 'is_failed', False) or not getattr(status, 'task_id', None):
+                raise Exception(f'NotebookLM slide deck generation rejected: {getattr(status, "error", None) or "no task_id returned"}')
+
+            # Allow up to 15 minutes
+            final = await client.artifacts.wait_for_completion(notebook_id, status.task_id, timeout=900.0)
+
+            if final.is_failed:
+                if final.is_rate_limited:
+                    raise Exception('NotebookLM rate limit exceeded — please try again later')
+                raise Exception(f'NotebookLM slide deck generation failed: {final.error or "unknown error"}')
+
+            # Download as PDF (for preview images)
+            pdf_path = os.path.join(output_dir, 'slides.pdf')
+            await client.artifacts.download_slide_deck(notebook_id, pdf_path)
+
+            # Download as PPTX (for final download)
+            pptx_path = os.path.join(output_dir, 'slides.pptx')
+            try:
+                await client.artifacts.download_slide_deck(notebook_id, pptx_path, format='pptx')
+            except Exception as e:
+                print(f"[NotebookLM] PPTX download failed ({e}), will use PDF only")
+                pptx_path = None
+
+            # Convert PDF pages to individual PNGs for preview
+            slide_image_paths = _pdf_to_images(pdf_path, output_dir)
+            print(f"[NotebookLM] Slide deck generated: {len(slide_image_paths)} slides")
+
+            return notebook_id, pdf_path, pptx_path, slide_image_paths
+
+        except Exception:
+            raise
+
+
 async def _cleanup_notebook_async(notebook_id):
     """Delete a temporary NotebookLM notebook."""
     from notebooklm import NotebookLMClient
@@ -274,6 +350,14 @@ def generate_video(source_text, storyboard_json, output_path, options=None, exis
     loop = _get_event_loop()
     return loop.run_until_complete(
         _generate_video_async(source_text, storyboard_json, output_path, options, existing_notebook_id)
+    )
+
+
+def generate_slide_deck(source_text, title, output_dir, options=None, existing_notebook_id=None):
+    """Sync wrapper: generate a slide deck PDF + PPTX + preview images from content."""
+    loop = _get_event_loop()
+    return loop.run_until_complete(
+        _generate_slide_deck_async(source_text, title, output_dir, options, existing_notebook_id)
     )
 
 

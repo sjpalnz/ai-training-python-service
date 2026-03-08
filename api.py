@@ -891,6 +891,180 @@ def generate_notebooklm_content():
         return jsonify({'error': str(e)}), 500
 
 
+def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing_notebook_id=None):
+    """Background worker: generate slide deck via NotebookLM, convert to preview images, upload all."""
+    try:
+        import shutil
+        from generate_notebooklm import generate_slide_deck
+        supabase = get_supabase_client()
+
+        # Update job → processing
+        supabase.table('generation_jobs').update({
+            'status': 'processing',
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        # Fetch document texts by ID
+        docs_result = supabase.table('documents') \
+            .select('id, filename, extracted_text') \
+            .in_('id', document_ids) \
+            .execute()
+
+        source_text = '\n\n'.join(
+            doc['extracted_text'][:10000] for doc in (docs_result.data or []) if doc.get('extracted_text')
+        )
+        if not source_text.strip():
+            raise Exception('No text content found in selected documents')
+
+        title = docs_result.data[0].get('filename', 'Slide Deck') if docs_result.data else 'Slide Deck'
+
+        # Create temp dir for this job's outputs
+        job_output_dir = os.path.join(OUTPUT_DIR, f'slides_{job_id}')
+        os.makedirs(job_output_dir, exist_ok=True)
+
+        # Generate via NotebookLM
+        notebook_id, pdf_path, pptx_path, slide_image_paths = generate_slide_deck(
+            source_text, title, job_output_dir,
+            options=options, existing_notebook_id=existing_notebook_id
+        )
+
+        # Update notebook ID for tracking
+        supabase.table('generation_jobs').update({
+            'notebooklm_notebook_id': notebook_id,
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # Upload PDF to Supabase Storage
+        pdf_storage_path = f"slide_decks/{job_id}_{timestamp}.pdf"
+        with open(pdf_path, 'rb') as f:
+            supabase.storage.from_('course-files').upload(
+                path=pdf_storage_path, file=f.read(),
+                file_options={"content-type": "application/pdf"}
+            )
+        pdf_url = supabase.storage.from_('course-files').get_public_url(pdf_storage_path)
+
+        # Upload PPTX if available
+        pptx_url = None
+        pptx_size = 0
+        if pptx_path and os.path.exists(pptx_path):
+            pptx_storage_path = f"slide_decks/{job_id}_{timestamp}.pptx"
+            with open(pptx_path, 'rb') as f:
+                pptx_bytes = f.read()
+                pptx_size = len(pptx_bytes)
+                supabase.storage.from_('course-files').upload(
+                    path=pptx_storage_path, file=pptx_bytes,
+                    file_options={"content-type": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}
+                )
+            pptx_url = supabase.storage.from_('course-files').get_public_url(pptx_storage_path)
+
+        # Upload per-slide preview images
+        slide_image_urls = []
+        for i, img_path in enumerate(slide_image_paths):
+            img_storage_path = f"slide_decks/{job_id}_slide_{i+1}.png"
+            with open(img_path, 'rb') as f:
+                supabase.storage.from_('course-files').upload(
+                    path=img_storage_path, file=f.read(),
+                    file_options={"content-type": "image/png"}
+                )
+            url = supabase.storage.from_('course-files').get_public_url(img_storage_path)
+            slide_image_urls.append(url)
+
+        # Use PPTX URL as primary file_url, fall back to PDF
+        primary_url = pptx_url or pdf_url
+        primary_size = pptx_size or os.path.getsize(pdf_path)
+
+        # Save to generated_files table
+        file_record = supabase.table('generated_files').insert({
+            'file_type': 'slide_deck',
+            'file_url': primary_url,
+            'file_size': primary_size,
+            'metadata': json.dumps({
+                'slide_images': slide_image_urls,
+                'pdf_url': pdf_url,
+                'pptx_url': pptx_url,
+                'notebook_id': notebook_id,
+                'slide_count': len(slide_image_urls),
+            })
+        }).execute()
+
+        # Update job → completed
+        supabase.table('generation_jobs').update({
+            'status': 'completed',
+            'result_file_id': file_record.data[0]['id'],
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        # Cleanup local temp files
+        shutil.rmtree(job_output_dir, ignore_errors=True)
+
+        print(f"[NotebookLM] Slide deck generated: {len(slide_image_urls)} slides")
+
+    except Exception as err:
+        import traceback
+        print(f"[NotebookLM] Slide deck job {job_id} failed: {err}")
+        print(f"[NotebookLM] Traceback:\n{traceback.format_exc()}")
+        try:
+            supabase = get_supabase_client()
+            supabase.table('generation_jobs').update({
+                'status': 'failed',
+                'error_message': str(err)[:500],
+                'updated_at': datetime.now().isoformat()
+            }).eq('id', job_id).execute()
+        except Exception:
+            pass
+
+
+@app.route('/generate-slides-content', methods=['POST'])
+def generate_slides_content():
+    """
+    Start async slide deck generation via NotebookLM.
+    Expected JSON: { "document_ids": [...], "user_id": "uuid",
+                     "instructions": "...", "slide_format": "DETAILED_DECK"|"PRESENTER_SLIDES",
+                     "slide_length": "DEFAULT"|"SHORT",
+                     "existing_notebook_id": null|"..." }
+    Returns: { "job_id": "uuid" } immediately; poll /job-status/<job_id>.
+    """
+    try:
+        data = request.json or {}
+        document_ids = data.get('document_ids', [])
+        user_id = data.get('user_id')
+        options = {
+            'instructions': data.get('instructions'),
+            'slide_format': data.get('slide_format', 'DETAILED_DECK'),
+            'slide_length': data.get('slide_length', 'DEFAULT'),
+        }
+        existing_notebook_id = data.get('existing_notebook_id')
+
+        if not document_ids:
+            return jsonify({'error': 'document_ids is required'}), 400
+        if not user_id:
+            return jsonify({'error': 'user_id is required'}), 400
+
+        supabase = get_supabase_client()
+
+        # Create job row (no course_id for standalone slide generation)
+        job = supabase.table('generation_jobs').insert({
+            'job_type': 'slide_deck',
+            'status': 'pending'
+        }).execute()
+
+        job_id = job.data[0]['id']
+
+        # Spawn background worker
+        threading.Thread(
+            target=_slide_deck_job_worker,
+            args=(job_id, document_ids, user_id, options, existing_notebook_id),
+            daemon=True
+        ).start()
+
+        return jsonify({'success': True, 'job_id': job_id})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/job-status/<job_id>', methods=['GET'])
 def job_status(job_id):
     """
@@ -914,12 +1088,22 @@ def job_status(job_id):
 
         if job['status'] == 'completed' and job.get('result_file_id'):
             file_result = supabase.table('generated_files') \
-                .select('file_url') \
+                .select('file_url, metadata') \
                 .eq('id', job['result_file_id']) \
                 .single() \
                 .execute()
             if file_result.data:
                 response['file_url'] = file_result.data['file_url']
+                # Include metadata for slide deck jobs (contains slide_images, pdf_url, etc.)
+                if file_result.data.get('metadata'):
+                    meta = file_result.data['metadata']
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except Exception:
+                            meta = None
+                    if meta:
+                        response['metadata'] = meta
 
         if job.get('error_message'):
             response['error_message'] = job['error_message']

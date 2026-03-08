@@ -11,3 +11,4 @@ google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
 google-api-python-client==2.100.0
 notebooklm-py
+pdf2image==1.17.0
