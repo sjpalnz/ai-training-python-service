@@ -1163,6 +1163,353 @@ def notebooklm_status():
         return jsonify({'available': False, 'error': str(e)})
 
 
+# ── TTS Voice Cloning & Voiceover Audio ──────────────────────────────────────
+
+def chunk_text_for_tts(text, max_chars=512):
+    """Split text into ≤512-char chunks at sentence boundaries."""
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks, current = [], ''
+    for sentence in sentences:
+        if not sentence.strip():
+            continue
+        # If single sentence exceeds limit, split at word boundaries
+        if len(sentence) > max_chars:
+            if current.strip():
+                chunks.append(current.strip())
+                current = ''
+            words = sentence.split(' ')
+            sub = ''
+            for w in words:
+                test = (sub + ' ' + w).strip()
+                if len(test) <= max_chars:
+                    sub = test
+                else:
+                    if sub.strip():
+                        chunks.append(sub.strip())
+                    sub = w
+            if sub.strip():
+                chunks.append(sub.strip())
+            continue
+        # Normal case: accumulate sentences
+        test = (current + ' ' + sentence).strip() if current else sentence
+        if len(test) <= max_chars:
+            current = test
+        else:
+            if current.strip():
+                chunks.append(current.strip())
+            current = sentence
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
+
+
+@app.route('/enroll-voice', methods=['POST'])
+def enroll_voice():
+    """
+    Enroll a voice with Qwen TTS voice cloning.
+    Expected JSON: { "audio_base64": "data:audio/wav;base64,...",
+                     "transcript": "...", "name": "My Voice", "user_id": "uuid" }
+    Returns: { "success": true, "voice_id": "...", "name": "..." }
+    """
+    try:
+        import requests as http_requests
+        data = request.json or {}
+        audio_base64 = data.get('audio_base64')
+        transcript = data.get('transcript', '')
+        name = data.get('name', 'My Voice')
+        user_id = data.get('user_id')
+
+        if not audio_base64:
+            return jsonify({'error': 'audio_base64 is required'}), 400
+        if not user_id:
+            return jsonify({'error': 'user_id is required'}), 400
+
+        alibaba_key = os.environ.get('ALIBABA_API_KEY')
+        if not alibaba_key:
+            return jsonify({'error': 'ALIBABA_API_KEY not configured'}), 500
+
+        enrollment_payload = {
+            "model": "qwen-voice-enrollment",
+            "input": {
+                "action": "create",
+                "target_model": "qwen3-tts-vc-2026-01-22",
+                "preferred_name": f"voice_{user_id[:8]}",
+                "audio": {
+                    "data": audio_base64,
+                },
+            }
+        }
+        if transcript.strip():
+            enrollment_payload["input"]["text"] = transcript.strip()
+
+        resp = http_requests.post(
+            'https://dashscope-intl.aliyuncs.com/api/v1/services/audio/tts/customization',
+            headers={
+                'Authorization': f'Bearer {alibaba_key}',
+                'Content-Type': 'application/json',
+            },
+            json=enrollment_payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        voice_id = result.get('output', {}).get('voice_id') or result.get('output', {}).get('voice')
+
+        if not voice_id:
+            return jsonify({'error': 'Enrollment failed: no voice_id returned', 'raw': result}), 500
+
+        # Save to tts_voices table
+        supabase = get_supabase_client()
+        voice_record = supabase.table('tts_voices').insert({
+            'user_id': user_id,
+            'voice_id': voice_id,
+            'name': name,
+        }).execute()
+
+        print(f"[TTS] Voice enrolled: {name} -> {voice_id}")
+
+        return jsonify({
+            'success': True,
+            'voice_id': voice_id,
+            'record_id': voice_record.data[0]['id'],
+            'name': name,
+        })
+
+    except Exception as e:
+        import traceback
+        print(f"[TTS] Voice enrollment failed: {e}")
+        print(f"[TTS] Traceback:\n{traceback.format_exc()}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/list-voices', methods=['POST'])
+def list_voices():
+    """List enrolled TTS voices for a user."""
+    try:
+        data = request.json or {}
+        user_id = data.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'user_id is required'}), 400
+
+        supabase = get_supabase_client()
+        result = supabase.table('tts_voices') \
+            .select('id, voice_id, name, is_default, created_at') \
+            .eq('user_id', user_id) \
+            .order('created_at', desc=True) \
+            .execute()
+
+        return jsonify({'success': True, 'voices': result.data or []})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def _voiceover_job_worker(job_id, scripts, voice_id, user_id):
+    """Background worker: generate voiceover audio for each slide, ZIP, upload."""
+    try:
+        import requests as http_requests
+        from pydub import AudioSegment
+        import zipfile
+        import io
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+        import shutil
+
+        supabase = get_supabase_client()
+        alibaba_key = os.environ.get('ALIBABA_API_KEY')
+
+        # Update job → processing
+        supabase.table('generation_jobs').update({
+            'status': 'processing',
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        job_dir = os.path.join(OUTPUT_DIR, f'voiceover_{job_id}')
+        os.makedirs(job_dir, exist_ok=True)
+
+        def synthesize_chunk(text_chunk, attempt=0):
+            """Call Qwen TTS synthesis API for a single chunk. Returns WAV bytes."""
+            max_attempts = 4
+            try:
+                resp = http_requests.post(
+                    'https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+                    headers={
+                        'Authorization': f'Bearer {alibaba_key}',
+                        'Content-Type': 'application/json',
+                    },
+                    json={
+                        "model": "qwen3-tts-vc-2026-01-22",
+                        "input": {
+                            "text": text_chunk,
+                            "voice": voice_id,
+                        }
+                    },
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                audio_url = result.get('output', {}).get('audio', {}).get('url')
+                if not audio_url:
+                    raise Exception(f'No audio URL in response: {result}')
+
+                # Download the WAV file
+                wav_resp = http_requests.get(audio_url, timeout=60)
+                wav_resp.raise_for_status()
+                return wav_resp.content
+
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    wait = (2 ** attempt) + 1
+                    print(f"[TTS] Chunk retry {attempt+1}/{max_attempts}: {e}, waiting {wait}s")
+                    time.sleep(wait)
+                    return synthesize_chunk(text_chunk, attempt + 1)
+                raise
+
+        slide_mp3_paths = []
+
+        for slide_idx, script in enumerate(scripts):
+            script = (script or '').strip()
+            if not script:
+                # Generate a brief silence for empty scripts
+                silence = AudioSegment.silent(duration=1000)
+                mp3_path = os.path.join(job_dir, f'slide_{slide_idx + 1:02d}.mp3')
+                silence.export(mp3_path, format='mp3')
+                slide_mp3_paths.append(mp3_path)
+                continue
+
+            # Chunk the script
+            chunks = chunk_text_for_tts(script, max_chars=512)
+            print(f"[TTS] Slide {slide_idx + 1}: {len(chunks)} chunks, {len(script)} chars")
+
+            # Synthesize chunks (parallelize within each slide)
+            chunk_wavs = [None] * len(chunks)
+
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                future_to_idx = {
+                    executor.submit(synthesize_chunk, chunk): i
+                    for i, chunk in enumerate(chunks)
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    chunk_wavs[idx] = future.result()
+
+            # Concatenate WAV chunks using pydub
+            combined = AudioSegment.empty()
+            for wav_bytes in chunk_wavs:
+                segment = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+                combined += segment
+
+            # Export as MP3
+            mp3_path = os.path.join(job_dir, f'slide_{slide_idx + 1:02d}.mp3')
+            combined.export(mp3_path, format='mp3', bitrate='128k')
+            slide_mp3_paths.append(mp3_path)
+            print(f"[TTS] Slide {slide_idx + 1}: MP3 exported ({len(combined)}ms)")
+
+        # Create ZIP
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        zip_filename = f'voiceover_{job_id[:8]}_{timestamp}.zip'
+        zip_path = os.path.join(OUTPUT_DIR, zip_filename)
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for mp3_path in slide_mp3_paths:
+                zf.write(mp3_path, os.path.basename(mp3_path))
+
+        # Upload ZIP to Supabase Storage
+        storage_path = f'voiceovers/{zip_filename}'
+        with open(zip_path, 'rb') as f:
+            file_bytes = f.read()
+
+        supabase.storage.from_('course-files').upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={"content-type": "application/zip"}
+        )
+        public_url = supabase.storage.from_('course-files').get_public_url(storage_path)
+
+        # Save to generated_files table
+        file_record = supabase.table('generated_files').insert({
+            'file_type': 'voiceover_audio',
+            'file_url': public_url,
+            'file_size': len(file_bytes),
+            'metadata': json.dumps({
+                'slide_count': len(scripts),
+                'voice_id': voice_id,
+            })
+        }).execute()
+
+        # Update job → completed
+        supabase.table('generation_jobs').update({
+            'status': 'completed',
+            'result_file_id': file_record.data[0]['id'],
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        # Cleanup
+        shutil.rmtree(job_dir, ignore_errors=True)
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
+        print(f"[TTS] Voiceover ZIP generated: {zip_filename} ({len(scripts)} slides)")
+
+    except Exception as err:
+        import traceback
+        print(f"[TTS] Job {job_id} failed: {err}")
+        print(f"[TTS] Traceback:\n{traceback.format_exc()}")
+        try:
+            supabase = get_supabase_client()
+            supabase.table('generation_jobs').update({
+                'status': 'failed',
+                'error_message': str(err)[:500],
+                'updated_at': datetime.now().isoformat()
+            }).eq('id', job_id).execute()
+        except Exception:
+            pass
+
+
+@app.route('/generate-voiceover-audio', methods=['POST'])
+def generate_voiceover_audio():
+    """
+    Start async voiceover audio generation.
+    Expected JSON: { "scripts": ["slide 1 text", ...], "voice_id": "...", "user_id": "uuid" }
+    Returns: { "job_id": "uuid" } immediately; poll /job-status/<job_id>.
+    """
+    try:
+        data = request.json or {}
+        scripts = data.get('scripts', [])
+        voice_id = data.get('voice_id')
+        user_id = data.get('user_id')
+
+        if not scripts:
+            return jsonify({'error': 'scripts array is required'}), 400
+        if not voice_id:
+            return jsonify({'error': 'voice_id is required'}), 400
+        if not user_id:
+            return jsonify({'error': 'user_id is required'}), 400
+
+        supabase = get_supabase_client()
+
+        # Create job row
+        job = supabase.table('generation_jobs').insert({
+            'job_type': 'voiceover_audio',
+            'status': 'pending',
+            'user_id': user_id,
+        }).execute()
+
+        job_id = job.data[0]['id']
+
+        # Spawn background worker
+        threading.Thread(
+            target=_voiceover_job_worker,
+            args=(job_id, scripts, voice_id, user_id),
+            daemon=True
+        ).start()
+
+        return jsonify({'success': True, 'job_id': job_id})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # --- Direct file-return endpoints (kept for local/direct use) ---
 
 @app.route('/generate-powerpoint', methods=['POST'])
