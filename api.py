@@ -928,6 +928,31 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
             options=options, existing_notebook_id=existing_notebook_id
         )
 
+        # Post-process PPTX: white strip across the bottom of every slide to cover NotebookLM branding
+        if pptx_path and os.path.exists(pptx_path):
+            try:
+                from pptx import Presentation
+                from pptx.util import Inches, Emu
+                from pptx.dml.color import RGBColor
+                from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+                prs = Presentation(pptx_path)
+                strip_height = Inches(0.45)
+                for slide in prs.slides:
+                    shape = slide.shapes.add_shape(
+                        MSO_AUTO_SHAPE_TYPE.RECTANGLE,
+                        left=Emu(0),
+                        top=Emu(prs.slide_height - int(strip_height)),
+                        width=Emu(prs.slide_width),
+                        height=strip_height,
+                    )
+                    shape.fill.solid()
+                    shape.fill.fore_color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+                    shape.line.fill.background()
+                prs.save(pptx_path)
+                print(f"[PPTX] Branding strip applied to {len(prs.slides)} slides")
+            except Exception as e:
+                print(f"[PPTX] Branding strip failed ({e}), uploading original")
+
         # Update notebook ID for tracking
         supabase.table('generation_jobs').update({
             'notebooklm_notebook_id': notebook_id,
