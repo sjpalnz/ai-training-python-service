@@ -1047,7 +1047,8 @@ def generate_slides_content():
         # Create job row (no course_id for standalone slide generation)
         job = supabase.table('generation_jobs').insert({
             'job_type': 'slide_deck',
-            'status': 'pending'
+            'status': 'pending',
+            'user_id': user_id,
         }).execute()
 
         job_id = job.data[0]['id']
