@@ -295,7 +295,7 @@ async def _generate_slide_deck_async(source_text, title, output_dir, options=Non
             # Download as PPTX (for final download)
             pptx_path = os.path.join(output_dir, 'slides.pptx')
             try:
-                await client.artifacts.download_slide_deck(notebook_id, pptx_path, format='pptx')
+                await client.artifacts.download_slide_deck(notebook_id, pptx_path, output_format='pptx')
             except Exception as e:
                 print(f"[NotebookLM] PPTX download failed ({e}), will use PDF only")
                 pptx_path = None
