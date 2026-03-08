@@ -1012,6 +1012,8 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
                 'notebook_id': notebook_id,
                 'slide_count': len(slide_image_urls),
                 'voiceover_scripts': voiceover_scripts,
+                'target_time': options.get('target_time') if options else None,
+                'max_time': options.get('max_time') if options else None,
             })
         }).execute()
 
@@ -1060,6 +1062,8 @@ def generate_slides_content():
             'instructions': data.get('instructions'),
             'slide_format': data.get('slide_format', 'DETAILED_DECK'),
             'slide_length': data.get('slide_length', 'DEFAULT'),
+            'target_time': data.get('target_time'),
+            'max_time': data.get('max_time'),
         }
         existing_notebook_id = data.get('existing_notebook_id')
 

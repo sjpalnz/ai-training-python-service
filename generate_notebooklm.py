@@ -346,6 +346,29 @@ async def _generate_slide_deck_async(source_text, title, output_dir, options=Non
                 for i, text in enumerate(slide_texts):
                     prompt_parts.append(f"Slide {i+1}:\n{text}")
 
+                # Build timing constraint if provided
+                target_time = opts.get('target_time') if opts else None
+                max_time = opts.get('max_time') if opts else None
+                timing_instruction = ""
+                if target_time and max_time:
+                    avg_per_slide = round(target_time * 60 / len(slide_texts))
+                    max_per_slide = round(max_time * 60 / len(slide_texts))
+                    timing_instruction = (
+                        f"\n\nIMPORTANT TIMING CONSTRAINT: The total voiceover narration for all slides combined "
+                        f"should target approximately {target_time} minutes and must not exceed {max_time} minutes. "
+                        f"With {len(slide_texts)} slides, aim for roughly {avg_per_slide} seconds per slide "
+                        f"(maximum {max_per_slide} seconds per slide). "
+                        f"A typical speaking pace is about 150 words per minute. "
+                        f"Adjust script length per slide accordingly — some slides may need shorter scripts, "
+                        f"others longer, but the total should stay within the time budget."
+                    )
+                elif target_time:
+                    avg_per_slide = round(target_time * 60 / len(slide_texts))
+                    timing_instruction = (
+                        f"\n\nTIMING GUIDELINE: The total voiceover narration should target approximately "
+                        f"{target_time} minutes ({avg_per_slide} seconds average per slide at ~150 words/minute)."
+                    )
+
                 prompt = (
                     f"You have created a {len(slide_texts)}-slide presentation based on the uploaded source documents.\n"
                     "Please write a voiceover narration script for a presenter to read aloud while presenting each slide.\n\n"
@@ -357,6 +380,7 @@ async def _generate_slide_deck_async(source_text, title, output_dir, options=Non
                     f"... and so on for all {len(slide_texts)} slides.\n\n"
                     "Make the narration natural and conversational, suitable for a professional training presentation. "
                     "Expand on the slide content using details from the source documents."
+                    + timing_instruction
                 )
 
                 print(f"[NotebookLM] Generating voiceover scripts for {len(slide_texts)} slides...")
