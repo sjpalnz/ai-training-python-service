@@ -923,7 +923,7 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
         os.makedirs(job_output_dir, exist_ok=True)
 
         # Generate via NotebookLM
-        notebook_id, pdf_path, pptx_path, slide_image_paths = generate_slide_deck(
+        notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck(
             source_text, title, job_output_dir,
             options=options, existing_notebook_id=existing_notebook_id
         )
@@ -1011,6 +1011,7 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
                 'pptx_url': pptx_url,
                 'notebook_id': notebook_id,
                 'slide_count': len(slide_image_urls),
+                'voiceover_scripts': voiceover_scripts,
             })
         }).execute()
 

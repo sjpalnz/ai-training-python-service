@@ -247,6 +247,35 @@ def _pdf_to_images(pdf_path, output_dir):
     return paths
 
 
+def _extract_slide_texts(pptx_path):
+    """Extract text content from each slide in a PPTX file."""
+    from pptx import Presentation
+    prs = Presentation(pptx_path)
+    slide_texts = []
+    for slide in prs.slides:
+        texts = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    text = para.text.strip()
+                    if text:
+                        texts.append(text)
+        slide_texts.append('\n'.join(texts))
+    return slide_texts
+
+
+def _parse_voiceover_scripts(response_text, expected_count):
+    """Parse [SLIDE N] markers from NBLM response into a list of per-slide scripts."""
+    import re
+    parts = re.split(r'\[SLIDE\s+\d+\]', response_text)
+    # First element is any text before [SLIDE 1], skip it
+    scripts = [p.strip() for p in parts[1:] if p.strip()]
+    # Pad or trim to match expected slide count
+    while len(scripts) < expected_count:
+        scripts.append('')
+    return scripts[:expected_count]
+
+
 async def _generate_slide_deck_async(source_text, title, output_dir, options=None, existing_notebook_id=None):
     """Create (or reuse) a NotebookLM notebook, generate slide deck, download PDF + PPTX + per-slide PNGs."""
     from notebooklm import NotebookLMClient
@@ -304,7 +333,42 @@ async def _generate_slide_deck_async(source_text, title, output_dir, options=Non
             slide_image_paths = _pdf_to_images(pdf_path, output_dir)
             print(f"[NotebookLM] Slide deck generated: {len(slide_image_paths)} slides")
 
-            return notebook_id, pdf_path, pptx_path, slide_image_paths
+            # Generate voiceover scripts via NBLM chat
+            voiceover_scripts = []
+            try:
+                source_pptx = pptx_path or pdf_path  # use whichever is available
+                if source_pptx and os.path.exists(source_pptx) and pptx_path:
+                    slide_texts = _extract_slide_texts(pptx_path)
+                else:
+                    slide_texts = [f"Slide {i+1}" for i in range(len(slide_image_paths))]
+
+                prompt_parts = []
+                for i, text in enumerate(slide_texts):
+                    prompt_parts.append(f"Slide {i+1}:\n{text}")
+
+                prompt = (
+                    f"You have created a {len(slide_texts)}-slide presentation based on the uploaded source documents.\n"
+                    "Please write a voiceover narration script for a presenter to read aloud while presenting each slide.\n\n"
+                    "Here is the text content of each slide:\n\n"
+                    + '\n\n'.join(prompt_parts) +
+                    "\n\nFormat your response with each slide's script preceded by [SLIDE N] on its own line:\n\n"
+                    "[SLIDE 1]\n(narration for slide 1)\n\n"
+                    "[SLIDE 2]\n(narration for slide 2)\n\n"
+                    f"... and so on for all {len(slide_texts)} slides.\n\n"
+                    "Make the narration natural and conversational, suitable for a professional training presentation. "
+                    "Expand on the slide content using details from the source documents."
+                )
+
+                print(f"[NotebookLM] Generating voiceover scripts for {len(slide_texts)} slides...")
+                result = await client.chat.ask(notebook_id, prompt)
+                answer_text = getattr(result, 'answer', '') or str(result)
+                voiceover_scripts = _parse_voiceover_scripts(answer_text, len(slide_image_paths))
+                print(f"[NotebookLM] Voiceover scripts generated: {len(voiceover_scripts)} scripts")
+            except Exception as e:
+                print(f"[NotebookLM] Voiceover script generation failed ({e}), returning empty scripts")
+                voiceover_scripts = [''] * len(slide_image_paths)
+
+            return notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts
 
         except Exception:
             raise
