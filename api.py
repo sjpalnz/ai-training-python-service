@@ -1305,12 +1305,12 @@ def list_voices():
         return jsonify({'error': str(e)}), 500
 
 
-def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
-    """Background worker: generate voiceover audio for each slide, create MP4 video, upload."""
+def _voiceover_job_worker(job_id, scripts, voice_id, user_id):
+    """Background worker: generate voiceover audio for each slide, ZIP MP3s, upload."""
     try:
         import requests as http_requests
         from pydub import AudioSegment
-        import subprocess
+        import zipfile
         import io
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import time
@@ -1406,7 +1406,109 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
             slide_mp3_paths.append(mp3_path)
             print(f"[TTS] Slide {slide_idx + 1}: MP3 exported ({len(combined)}ms)")
 
-        # ── Phase 1: Download slide images from Supabase Storage URLs ──
+        # ── Create ZIP of all slide MP3s ──
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        zip_filename = f'voiceover_{job_id[:8]}_{timestamp}.zip'
+        output_zip_path = os.path.join(OUTPUT_DIR, zip_filename)
+
+        with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for mp3_path in slide_mp3_paths:
+                zf.write(mp3_path, os.path.basename(mp3_path))
+
+        print(f"[TTS] ZIP created: {zip_filename} ({len(slide_mp3_paths)} files)")
+
+        # ── Upload ZIP to Supabase Storage ──
+        storage_path = f'voiceovers/{zip_filename}'
+        with open(output_zip_path, 'rb') as f:
+            file_bytes = f.read()
+
+        supabase.storage.from_('course-files').upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={"content-type": "application/zip"}
+        )
+        public_url = supabase.storage.from_('course-files').get_public_url(storage_path)
+
+        # Save to generated_files table
+        file_record = supabase.table('generated_files').insert({
+            'file_type': 'voiceover_audio',
+            'file_url': public_url,
+            'file_size': len(file_bytes),
+            'metadata': json.dumps({
+                'slide_count': len(scripts),
+                'voice_id': voice_id,
+            })
+        }).execute()
+
+        # Update job → completed
+        supabase.table('generation_jobs').update({
+            'status': 'completed',
+            'result_file_id': file_record.data[0]['id'],
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        # Cleanup
+        shutil.rmtree(job_dir, ignore_errors=True)
+        if os.path.exists(output_zip_path):
+            os.remove(output_zip_path)
+
+        print(f"[TTS] Voiceover audio ZIP generated: {zip_filename} ({len(scripts)} slides)")
+
+    except Exception as err:
+        import traceback
+        print(f"[TTS] Job {job_id} failed: {err}")
+        print(f"[TTS] Traceback:\n{traceback.format_exc()}")
+        try:
+            supabase = get_supabase_client()
+            supabase.table('generation_jobs').update({
+                'status': 'failed',
+                'error_message': str(err)[:500],
+                'updated_at': datetime.now().isoformat()
+            }).eq('id', job_id).execute()
+        except Exception:
+            pass
+
+
+def _voiceover_video_job_worker(job_id, audio_zip_url, slide_image_urls, user_id):
+    """Background worker: download audio ZIP + slide images, render MP4 video."""
+    try:
+        import requests as http_requests
+        from pydub import AudioSegment
+        import subprocess
+        import zipfile
+        import io
+        import shutil
+
+        supabase = get_supabase_client()
+
+        # Update job → processing
+        supabase.table('generation_jobs').update({
+            'status': 'processing',
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        job_dir = os.path.join(OUTPUT_DIR, f'video_{job_id}')
+        os.makedirs(job_dir, exist_ok=True)
+
+        # ── Phase 1: Download and extract audio ZIP ──
+        print(f"[MP4] Downloading audio ZIP...")
+        zip_resp = http_requests.get(audio_zip_url, timeout=120)
+        zip_resp.raise_for_status()
+
+        audio_dir = os.path.join(job_dir, 'audio')
+        os.makedirs(audio_dir, exist_ok=True)
+
+        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+            zf.extractall(audio_dir)
+
+        # Collect MP3 paths sorted by filename
+        mp3_files = sorted([
+            os.path.join(audio_dir, f) for f in os.listdir(audio_dir)
+            if f.endswith('.mp3')
+        ])
+        print(f"[MP4] Extracted {len(mp3_files)} MP3 files from ZIP")
+
+        # ── Phase 2: Download slide images ──
         slide_image_paths = []
         for i, url in enumerate(slide_image_urls):
             img_path = os.path.join(job_dir, f'slide_{i + 1:02d}.png')
@@ -1417,12 +1519,11 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
             slide_image_paths.append(img_path)
             print(f"[MP4] Downloaded slide image {i + 1}/{len(slide_image_urls)}")
 
-        # ── Phase 2: Create per-slide video segments ──
+        # ── Phase 3: Create per-slide video segments ──
         segment_paths = []
         total_duration_ms = 0
 
-        for i, mp3_path in enumerate(slide_mp3_paths):
-            # Load slide audio
+        for i, mp3_path in enumerate(mp3_files):
             slide_audio = AudioSegment.from_mp3(mp3_path)
 
             # Create padded audio: 1s silence + audio + 2s silence
@@ -1442,7 +1543,6 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
             elif slide_image_paths:
                 img_path = slide_image_paths[-1]
             else:
-                # Create a blank black image as fallback
                 img_path = os.path.join(job_dir, 'blank.png')
                 if not os.path.exists(img_path):
                     subprocess.run([
@@ -1471,9 +1571,9 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
                 raise Exception(f"Video encoding failed for slide {i+1}. Check server logs for details.")
 
             segment_paths.append(segment_path)
-            print(f"[MP4] Segment {i + 1}/{len(slide_mp3_paths)}: {padded_duration_s:.1f}s")
+            print(f"[MP4] Segment {i + 1}/{len(mp3_files)}: {padded_duration_s:.1f}s")
 
-        # ── Phase 3: Concatenate all segments into final MP4 ──
+        # ── Phase 4: Concatenate all segments into final MP4 ──
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         mp4_filename = f'voiceover_{job_id[:8]}_{timestamp}.mp4'
         output_mp4_path = os.path.join(OUTPUT_DIR, mp4_filename)
@@ -1496,7 +1596,7 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
 
         print(f"[MP4] Final video created: {mp4_filename} ({total_duration_ms / 1000:.1f}s total)")
 
-        # ── Phase 4: Upload MP4 to Supabase Storage ──
+        # ── Phase 5: Upload MP4 to Supabase Storage ──
         storage_path = f'voiceovers/{mp4_filename}'
         with open(output_mp4_path, 'rb') as f:
             file_bytes = f.read()
@@ -1514,8 +1614,7 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
             'file_url': public_url,
             'file_size': len(file_bytes),
             'metadata': json.dumps({
-                'slide_count': len(scripts),
-                'voice_id': voice_id,
+                'slide_count': len(mp3_files),
                 'duration_ms': total_duration_ms,
                 'resolution': '1920x1080',
             })
@@ -1533,12 +1632,12 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
         if os.path.exists(output_mp4_path):
             os.remove(output_mp4_path)
 
-        print(f"[MP4] Voiceover video generated: {mp4_filename} ({len(scripts)} slides)")
+        print(f"[MP4] Voiceover video generated: {mp4_filename} ({len(mp3_files)} slides)")
 
     except Exception as err:
         import traceback
-        print(f"[TTS] Job {job_id} failed: {err}")
-        print(f"[TTS] Traceback:\n{traceback.format_exc()}")
+        print(f"[MP4] Job {job_id} failed: {err}")
+        print(f"[MP4] Traceback:\n{traceback.format_exc()}")
         try:
             supabase = get_supabase_client()
             supabase.table('generation_jobs').update({
@@ -1553,9 +1652,8 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
 @app.route('/generate-voiceover-audio', methods=['POST'])
 def generate_voiceover_audio():
     """
-    Start async voiceover audio generation.
-    Expected JSON: { "scripts": ["slide 1 text", ...], "voice_id": "...",
-                     "user_id": "uuid", "slide_image_urls": ["url1", ...] }
+    Start async voiceover audio generation (audio ZIP only).
+    Expected JSON: { "scripts": ["slide 1 text", ...], "voice_id": "...", "user_id": "uuid" }
     Returns: { "job_id": "uuid" } immediately; poll /job-status/<job_id>.
     """
     try:
@@ -1563,7 +1661,6 @@ def generate_voiceover_audio():
         scripts = data.get('scripts', [])
         voice_id = data.get('voice_id')
         user_id = data.get('user_id')
-        slide_image_urls = data.get('slide_image_urls', [])
 
         if not scripts:
             return jsonify({'error': 'scripts array is required'}), 400
@@ -1586,7 +1683,51 @@ def generate_voiceover_audio():
         # Spawn background worker
         threading.Thread(
             target=_voiceover_job_worker,
-            args=(job_id, scripts, voice_id, user_id, slide_image_urls),
+            args=(job_id, scripts, voice_id, user_id),
+            daemon=True
+        ).start()
+
+        return jsonify({'success': True, 'job_id': job_id})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/generate-voiceover-video', methods=['POST'])
+def generate_voiceover_video():
+    """
+    Start async voiceover video generation from existing audio ZIP + slide images.
+    Expected JSON: { "audio_zip_url": "...", "slide_image_urls": [...], "user_id": "uuid" }
+    Returns: { "job_id": "uuid" } immediately; poll /job-status/<job_id>.
+    """
+    try:
+        data = request.json or {}
+        audio_zip_url = data.get('audio_zip_url')
+        slide_image_urls = data.get('slide_image_urls', [])
+        user_id = data.get('user_id')
+
+        if not audio_zip_url:
+            return jsonify({'error': 'audio_zip_url is required'}), 400
+        if not slide_image_urls:
+            return jsonify({'error': 'slide_image_urls array is required'}), 400
+        if not user_id:
+            return jsonify({'error': 'user_id is required'}), 400
+
+        supabase = get_supabase_client()
+
+        # Create job row
+        job = supabase.table('generation_jobs').insert({
+            'job_type': 'voiceover_video',
+            'status': 'pending',
+            'user_id': user_id,
+        }).execute()
+
+        job_id = job.data[0]['id']
+
+        # Spawn background worker
+        threading.Thread(
+            target=_voiceover_video_job_worker,
+            args=(job_id, audio_zip_url, slide_image_urls, user_id),
             daemon=True
         ).start()
 
