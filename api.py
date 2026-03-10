@@ -1455,11 +1455,12 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
             segment_path = os.path.join(job_dir, f'segment_{i + 1:02d}.mp4')
             ffmpeg_result = subprocess.run([
                 'ffmpeg', '-y',
-                '-loop', '1', '-i', img_path,
+                '-loop', '1', '-framerate', '1', '-i', img_path,
                 '-i', padded_path,
                 '-c:v', 'libx264', '-tune', 'stillimage',
                 '-c:a', 'aac', '-b:a', '192k',
                 '-pix_fmt', 'yuv420p',
+                '-r', '25',
                 '-t', str(padded_duration_s),
                 '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black',
                 '-shortest',
