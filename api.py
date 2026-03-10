@@ -1455,20 +1455,20 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
             segment_path = os.path.join(job_dir, f'segment_{i + 1:02d}.mp4')
             ffmpeg_result = subprocess.run([
                 'ffmpeg', '-y',
-                '-loop', '1', '-framerate', '1', '-i', img_path,
+                '-loop', '1', '-framerate', '25', '-i', img_path,
                 '-i', padded_path,
                 '-c:v', 'libx264', '-tune', 'stillimage',
                 '-c:a', 'aac', '-b:a', '192k',
-                '-pix_fmt', 'yuv420p',
-                '-r', '25',
                 '-t', str(padded_duration_s),
-                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black',
+                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p',
+                '-movflags', '+faststart',
                 '-shortest',
                 segment_path
             ], capture_output=True, text=True)
             if ffmpeg_result.returncode != 0:
-                print(f"[MP4] ffmpeg segment error: {ffmpeg_result.stderr[-1000:]}")
-                raise Exception(f"ffmpeg failed for slide {i+1}: {ffmpeg_result.stderr[-300:]}")
+                err_lines = [l for l in ffmpeg_result.stderr.split('\n') if l.strip() and not l.strip().startswith('frame=')]
+                print(f"[MP4] ffmpeg segment error (slide {i+1}):\n" + '\n'.join(err_lines[-20:]))
+                raise Exception(f"Video encoding failed for slide {i+1}. Check server logs for details.")
 
             segment_paths.append(segment_path)
             print(f"[MP4] Segment {i + 1}/{len(slide_mp3_paths)}: {padded_duration_s:.1f}s")
