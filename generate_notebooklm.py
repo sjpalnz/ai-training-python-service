@@ -264,12 +264,41 @@ def _extract_slide_texts(pptx_path):
     return slide_texts
 
 
+def _clean_voiceover_script(text):
+    """Remove reference numbers, citations, and other TTS-unfriendly artifacts."""
+    import re
+    # Bracketed references: [1], [2, 3], [ref], [i], [ii]
+    text = re.sub(r'\[\d+(?:\s*,\s*\d+)*\]', '', text)
+    text = re.sub(r'\[[ivxlc]+\]', '', text, flags=re.IGNORECASE)
+    # Parenthetical citations: (p. 42), (pp. 10-15), (Smith, 2024), (Section 3.2)
+    text = re.sub(r'\(pp?\.\s*\d[\d\-–, ]*\)', '', text)
+    text = re.sub(r'\([A-Z][a-z]+(?:\s+(?:et\s+al\.?|&|and)\s+[A-Z][a-z]+)?,?\s*\d{4}\)', '', text)
+    text = re.sub(r'\((?:Section|Clause|Article|Chapter|Part|Appendix|Table|Figure)\s+[\d.]+[a-z]?\)', '', text, flags=re.IGNORECASE)
+    # Standard codes: AS/NZS 4801:2001, ISO 9001:2015, BS EN 1234
+    text = re.sub(r'\b[A-Z]{2,}(?:/[A-Z]{2,})*\s+\d{3,}(?::\d{4})?\b', '', text)
+    # Section/clause references inline: Section 3.2.1, Clause 4.5, Article 12(b)
+    text = re.sub(r'\b(?:Section|Clause|Article|Appendix)\s+\d+(?:\.\d+)*(?:\([a-z]\))?', '', text, flags=re.IGNORECASE)
+    # Document reference codes: DOC-2024-0451, REF-123, ID: ABC-123
+    text = re.sub(r'\b[A-Z]{2,}-\d{2,}(?:-\d+)*\b', '', text)
+    text = re.sub(r'\b(?:Ref|ID|Doc)[\s.:]+[A-Z0-9][\w\-]*', '', text, flags=re.IGNORECASE)
+    # Footnote markers
+    text = re.sub(r'[*†‡§¶]+(?=\s|$)', '', text)
+    # Markdown bold/italic
+    text = re.sub(r'\*{1,2}(.+?)\*{1,2}', r'\1', text)
+    # Clean up leftover punctuation artifacts and multiple spaces
+    text = re.sub(r'\(\s*\)', '', text)        # empty parens
+    text = re.sub(r'\[\s*\]', '', text)        # empty brackets
+    text = re.sub(r'\s{2,}', ' ', text)        # collapse spaces
+    text = re.sub(r'\s+([.,;:!?])', r'\1', text)  # space before punctuation
+    return text.strip()
+
+
 def _parse_voiceover_scripts(response_text, expected_count):
     """Parse [SLIDE N] markers from NBLM response into a list of per-slide scripts."""
     import re
     parts = re.split(r'\[SLIDE\s+\d+\]', response_text)
     # First element is any text before [SLIDE 1], skip it
-    scripts = [p.strip() for p in parts[1:] if p.strip()]
+    scripts = [_clean_voiceover_script(p.strip()) for p in parts[1:] if p.strip()]
     # Pad or trim to match expected slide count
     while len(scripts) < expected_count:
         scripts.append('')
@@ -379,7 +408,11 @@ async def _generate_slide_deck_async(source_text, title, output_dir, options=Non
                     "[SLIDE 2]\n(narration for slide 2)\n\n"
                     f"... and so on for all {len(slide_texts)} slides.\n\n"
                     "Make the narration natural and conversational, suitable for a professional training presentation. "
-                    "Expand on the slide content using details from the source documents."
+                    "Expand on the slide content using details from the source documents.\n\n"
+                    "IMPORTANT: This script will be read aloud by a text-to-speech system. "
+                    "Do NOT include document reference numbers, citation markers, section numbers, "
+                    "standard codes (e.g. 'AS/NZS 4801'), page references, footnote markers, "
+                    "or any alphanumeric identifiers. Paraphrase content naturally instead of citing sources."
                     + timing_instruction
                 )
 
