@@ -1453,7 +1453,7 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
 
             # Create video segment via ffmpeg
             segment_path = os.path.join(job_dir, f'segment_{i + 1:02d}.mp4')
-            subprocess.run([
+            ffmpeg_result = subprocess.run([
                 'ffmpeg', '-y',
                 '-loop', '1', '-i', img_path,
                 '-i', padded_path,
@@ -1464,7 +1464,10 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
                 '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black',
                 '-shortest',
                 segment_path
-            ], check=True, capture_output=True)
+            ], capture_output=True, text=True)
+            if ffmpeg_result.returncode != 0:
+                print(f"[MP4] ffmpeg segment error: {ffmpeg_result.stderr[-1000:]}")
+                raise Exception(f"ffmpeg failed for slide {i+1}: {ffmpeg_result.stderr[-300:]}")
 
             segment_paths.append(segment_path)
             print(f"[MP4] Segment {i + 1}/{len(slide_mp3_paths)}: {padded_duration_s:.1f}s")
@@ -1479,13 +1482,16 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id, slide_image_urls):
             for seg_path in segment_paths:
                 f.write(f"file '{seg_path}'\n")
 
-        subprocess.run([
+        concat_result = subprocess.run([
             'ffmpeg', '-y',
             '-f', 'concat', '-safe', '0',
             '-i', concat_list_path,
             '-c', 'copy',
             output_mp4_path
-        ], check=True, capture_output=True)
+        ], capture_output=True, text=True)
+        if concat_result.returncode != 0:
+            print(f"[MP4] ffmpeg concat error: {concat_result.stderr[-1000:]}")
+            raise Exception(f"ffmpeg concat failed: {concat_result.stderr[-300:]}")
 
         print(f"[MP4] Final video created: {mp4_filename} ({total_duration_ms / 1000:.1f}s total)")
 
