@@ -1552,23 +1552,28 @@ def _voiceover_video_job_worker(job_id, audio_zip_url, slide_image_urls, user_id
                     ], check=True, capture_output=True)
 
             # Create video segment via ffmpeg
+            # -preset ultrafast: dramatically reduces RAM usage (avoids OOM on Railway)
+            # -crf 28: slightly higher compression, less memory for rate control
+            # -threads 2: cap threads to avoid memory pressure from parallel encoding
+            # 1280x720: lower resolution reduces memory by ~55% vs 1920x1080
             segment_path = os.path.join(job_dir, f'segment_{i + 1:02d}.mp4')
             ffmpeg_result = subprocess.run([
                 'ffmpeg', '-y',
-                '-loop', '1', '-framerate', '25', '-i', img_path,
+                '-loop', '1', '-framerate', '1', '-i', img_path,
                 '-i', padded_path,
-                '-c:v', 'libx264', '-tune', 'stillimage',
-                '-c:a', 'aac', '-b:a', '192k',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
+                '-crf', '28', '-threads', '2',
+                '-c:a', 'aac', '-b:a', '128k',
                 '-t', str(padded_duration_s),
-                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p',
+                '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p',
                 '-movflags', '+faststart',
                 '-shortest',
                 segment_path
             ], capture_output=True, text=True)
             if ffmpeg_result.returncode != 0:
                 err_lines = [l for l in ffmpeg_result.stderr.split('\n') if l.strip() and not l.strip().startswith('frame=')]
-                print(f"[MP4] ffmpeg segment error (slide {i+1}):\n" + '\n'.join(err_lines[-20:]))
-                raise Exception(f"Video encoding failed for slide {i+1}. Check server logs for details.")
+                print(f"[MP4] ffmpeg segment error (slide {i+1}, rc={ffmpeg_result.returncode}):\n" + '\n'.join(err_lines[-30:]))
+                raise Exception(f"Video encoding failed for slide {i+1} (rc={ffmpeg_result.returncode}). Check server logs for details.")
 
             segment_paths.append(segment_path)
             print(f"[MP4] Segment {i + 1}/{len(mp3_files)}: {padded_duration_s:.1f}s")
