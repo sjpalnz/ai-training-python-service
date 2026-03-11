@@ -1969,7 +1969,7 @@ def push_to_scorm_cloud():
         course_id = f"{slug}-{int(_time.time())}"
 
         # 3. Upload to SCORM Cloud API v2
-        scorm_cloud_url = f"https://cloud.scorm.com/api/v2/courses/uploadAndImport?courseId={course_id}"
+        scorm_cloud_url = f"https://cloud.scorm.com/api/v2/courses/importJobs/upload?courseId={course_id}"
         print(f"[push-to-scorm-cloud] Uploading to SCORM Cloud as courseId={course_id}")
 
         upload_resp = http_requests.post(
