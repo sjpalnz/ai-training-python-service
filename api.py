@@ -1938,6 +1938,194 @@ def reindex_documents():
 # SCORM Cloud LMS Push
 ###############################################################################
 
+@app.route('/extract-scorm-cloud-text', methods=['POST'])
+def extract_scorm_cloud_text():
+    """Download a SCORM package from SCORM Cloud and extract text content."""
+    try:
+        import requests as http_requests
+        import zipfile
+        import io
+        import xml.etree.ElementTree as ET
+        from bs4 import BeautifulSoup
+
+        data = request.get_json()
+        course_id = data.get('course_id')
+        app_id = data.get('app_id')
+        secret_key = data.get('secret_key')
+
+        if not course_id:
+            return jsonify({'error': 'course_id is required'}), 400
+        if not app_id or not secret_key:
+            return jsonify({'error': 'SCORM Cloud credentials are required'}), 400
+
+        # 1. Download the course ZIP from SCORM Cloud
+        print(f"[extract-scorm] Downloading ZIP for courseId={course_id}")
+        zip_resp = http_requests.get(
+            f"https://cloud.scorm.com/api/v2/courses/{course_id}/zip",
+            auth=(app_id, secret_key),
+            timeout=120,
+        )
+        if zip_resp.status_code == 404:
+            return jsonify({'error': 'Course not found in SCORM Cloud'}), 404
+        if zip_resp.status_code == 401:
+            return jsonify({'error': 'SCORM Cloud authentication failed'}), 401
+        if zip_resp.status_code != 200:
+            return jsonify({'error': f'Failed to download course (HTTP {zip_resp.status_code})'}), 500
+
+        zip_bytes = zip_resp.content
+        print(f"[extract-scorm] Downloaded {len(zip_bytes)} bytes")
+
+        # 2. Open ZIP and find content files
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        filenames = zf.namelist()
+
+        # Try to find imsmanifest.xml to identify the correct HTML entry files
+        html_files = []
+        course_title = course_id  # fallback title
+
+        manifest_names = [f for f in filenames if f.lower().endswith('imsmanifest.xml')]
+        if manifest_names:
+            try:
+                manifest_content = zf.read(manifest_names[0]).decode('utf-8', errors='ignore')
+                root = ET.fromstring(manifest_content)
+
+                # Extract course title from manifest metadata
+                # Try multiple namespace patterns
+                for ns_prefix in [
+                    '{http://www.imsproject.org/xsd/imscp_rootv1p1p2}',
+                    '{http://www.imsglobal.org/xsd/imscp_v1p1}',
+                    '',
+                ]:
+                    title_el = root.find(f'.//{ns_prefix}title')
+                    if title_el is not None and title_el.text:
+                        course_title = title_el.text.strip()
+                        break
+
+                # Find resource hrefs (HTML entry points)
+                for ns_prefix in [
+                    '{http://www.imsproject.org/xsd/imscp_rootv1p1p2}',
+                    '{http://www.imsglobal.org/xsd/imscp_v1p1}',
+                    '',
+                ]:
+                    resources = root.findall(f'.//{ns_prefix}resource')
+                    if resources:
+                        for res in resources:
+                            href = res.get('href', '')
+                            if href and (href.endswith('.html') or href.endswith('.htm')):
+                                html_files.append(href)
+                        break
+
+                print(f"[extract-scorm] Manifest title: {course_title}, {len(html_files)} HTML resources")
+            except Exception as e:
+                print(f"[extract-scorm] Warning: failed to parse manifest: {e}")
+
+        # If manifest parsing didn't find HTML files, find them in the ZIP directly
+        if not html_files:
+            html_files = [f for f in filenames
+                         if (f.endswith('.html') or f.endswith('.htm'))
+                         and not f.startswith('__MACOSX')
+                         and '/.' not in f]
+
+        if not html_files:
+            return jsonify({'error': 'No HTML content found in SCORM package'}), 400
+
+        print(f"[extract-scorm] Found {len(html_files)} HTML files to parse")
+
+        # 3. Extract text from HTML files
+        slides = []
+        slide_num = 0
+
+        for html_file in html_files:
+            try:
+                html_content = zf.read(html_file).decode('utf-8', errors='ignore')
+                soup = BeautifulSoup(html_content, 'html.parser')
+
+                # Remove script, style, noscript tags
+                for tag in soup(['script', 'style', 'noscript', 'nav', 'header', 'footer']):
+                    tag.decompose()
+
+                # Strategy 1: Look for slide-like div structures (our own SCORM packages)
+                slide_divs = soup.find_all('div', class_=lambda c: c and 'slide' in str(c).lower()) if soup.find('div', class_=lambda c: c and 'slide' in str(c).lower()) else []
+
+                if slide_divs:
+                    for div in slide_divs:
+                        slide_num += 1
+                        # Find title (h1, h2, h3, or first strong/b)
+                        title_el = div.find(['h1', 'h2', 'h3'])
+                        title = title_el.get_text(strip=True) if title_el else f'Slide {slide_num}'
+                        if title_el:
+                            title_el.decompose()
+                        text = div.get_text(separator='\n', strip=True)
+                        if text.strip():
+                            slides.append({
+                                'number': slide_num,
+                                'title': title[:200],
+                                'text': text[:3000]
+                            })
+                else:
+                    # Strategy 2: Treat each HTML file as a page, extract sections
+                    # Find the main content area (body or main content div)
+                    body = soup.find('body') or soup
+
+                    # Try to split by headings
+                    headings = body.find_all(['h1', 'h2', 'h3'])
+                    if headings:
+                        for heading in headings:
+                            slide_num += 1
+                            title = heading.get_text(strip=True)
+
+                            # Collect text between this heading and the next
+                            text_parts = []
+                            sibling = heading.find_next_sibling()
+                            while sibling and sibling.name not in ['h1', 'h2', 'h3']:
+                                t = sibling.get_text(separator='\n', strip=True)
+                                if t:
+                                    text_parts.append(t)
+                                sibling = sibling.find_next_sibling()
+
+                            text = '\n'.join(text_parts)
+                            if title.strip() or text.strip():
+                                slides.append({
+                                    'number': slide_num,
+                                    'title': title[:200] or f'Section {slide_num}',
+                                    'text': text[:3000]
+                                })
+                    else:
+                        # No headings — treat entire page as one slide
+                        text = body.get_text(separator='\n', strip=True)
+                        if text.strip() and len(text.strip()) > 20:
+                            slide_num += 1
+                            # Use filename as title
+                            page_title = html_file.rsplit('/', 1)[-1].replace('.html', '').replace('.htm', '').replace('_', ' ').replace('-', ' ').title()
+                            slides.append({
+                                'number': slide_num,
+                                'title': page_title[:200],
+                                'text': text[:3000]
+                            })
+            except Exception as e:
+                print(f"[extract-scorm] Warning: failed to parse {html_file}: {e}")
+                continue
+
+        zf.close()
+
+        if not slides:
+            return jsonify({'error': 'Could not extract text content from SCORM package. The content may be JavaScript-rendered or image-based.'}), 400
+
+        print(f"[extract-scorm] Extracted {len(slides)} slides/sections from {course_id}")
+
+        return jsonify({
+            'success': True,
+            'slides': slides,
+            'course_title': course_title,
+            'slide_count': len(slides),
+        })
+
+    except Exception as e:
+        print(f"[extract-scorm] Error: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/push-to-scorm-cloud', methods=['POST'])
 def push_to_scorm_cloud():
     """Download a SCORM ZIP from storage and upload it to SCORM Cloud via API v2."""
