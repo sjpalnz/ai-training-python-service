@@ -1934,6 +1934,96 @@ def reindex_documents():
         return jsonify({'error': str(e)}), 500
 
 
+###############################################################################
+# SCORM Cloud LMS Push
+###############################################################################
+
+@app.route('/push-to-scorm-cloud', methods=['POST'])
+def push_to_scorm_cloud():
+    """Download a SCORM ZIP from storage and upload it to SCORM Cloud via API v2."""
+    try:
+        data = request.get_json()
+        scorm_url = data.get('scorm_url')
+        course_title = data.get('course_title', 'Untitled Course')
+        app_id = data.get('app_id')
+        secret_key = data.get('secret_key')
+
+        if not scorm_url:
+            return jsonify({'error': 'scorm_url is required'}), 400
+        if not app_id or not secret_key:
+            return jsonify({'error': 'SCORM Cloud credentials (app_id, secret_key) are required'}), 400
+
+        import re, time as _time
+        import requests as http_requests
+
+        # 1. Download the SCORM ZIP from Supabase Storage
+        print(f"[push-to-scorm-cloud] Downloading SCORM from: {scorm_url[:80]}...")
+        dl_resp = http_requests.get(scorm_url, timeout=60)
+        if dl_resp.status_code != 200:
+            return jsonify({'error': f'Failed to download SCORM package (HTTP {dl_resp.status_code})'}), 500
+        zip_bytes = dl_resp.content
+        print(f"[push-to-scorm-cloud] Downloaded {len(zip_bytes)} bytes")
+
+        # 2. Generate a courseId (alphanumeric + hyphens, max 200 chars)
+        slug = re.sub(r'[^a-zA-Z0-9]+', '-', course_title).strip('-').lower()[:80]
+        course_id = f"{slug}-{int(_time.time())}"
+
+        # 3. Upload to SCORM Cloud API v2
+        scorm_cloud_url = f"https://cloud.scorm.com/api/v2/courses/uploadAndImport?courseId={course_id}"
+        print(f"[push-to-scorm-cloud] Uploading to SCORM Cloud as courseId={course_id}")
+
+        upload_resp = http_requests.post(
+            scorm_cloud_url,
+            auth=(app_id, secret_key),
+            files={'file': ('course.zip', zip_bytes, 'application/zip')},
+            timeout=120,
+        )
+
+        if upload_resp.status_code not in (200, 201):
+            error_text = upload_resp.text[:500]
+            print(f"[push-to-scorm-cloud] Upload failed: {upload_resp.status_code} {error_text}")
+            if upload_resp.status_code == 401:
+                return jsonify({'error': 'SCORM Cloud authentication failed — check your App ID and Secret Key'}), 401
+            return jsonify({'error': f'SCORM Cloud upload failed ({upload_resp.status_code}): {error_text}'}), 500
+
+        upload_result = upload_resp.json()
+        import_job_id = upload_result.get('result') or upload_result.get('id') or upload_result.get('jobId')
+        print(f"[push-to-scorm-cloud] Import job started: {import_job_id}")
+
+        # 4. Poll for import completion (max 60s, every 3s)
+        status = 'RUNNING'
+        for _ in range(20):
+            _time.sleep(3)
+            poll_resp = http_requests.get(
+                f"https://cloud.scorm.com/api/v2/courses/importJobs/{import_job_id}",
+                auth=(app_id, secret_key),
+                timeout=30,
+            )
+            if poll_resp.status_code == 200:
+                poll_data = poll_resp.json()
+                status = poll_data.get('status', 'UNKNOWN')
+                print(f"[push-to-scorm-cloud] Poll status: {status}")
+                if status in ('COMPLETE', 'ERROR', 'RUNNING'):
+                    if status != 'RUNNING':
+                        break
+
+        if status == 'ERROR':
+            return jsonify({'error': 'SCORM Cloud import failed — the package may be invalid'}), 500
+
+        print(f"[push-to-scorm-cloud] Done! courseId={course_id}, status={status}")
+        return jsonify({
+            'success': True,
+            'course_id': course_id,
+            'import_job_id': import_job_id,
+            'status': status,
+        })
+
+    except Exception as e:
+        print(f"[push-to-scorm-cloud] Error: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
