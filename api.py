@@ -2126,6 +2126,275 @@ def extract_scorm_cloud_text():
         return jsonify({'error': str(e)}), 500
 
 
+def _transcription_job_worker(job_id, media_files, course_id, user_id):
+    """Background worker: transcribe audio/video files from a SCORM package using DashScope STT."""
+    try:
+        import requests as http_requests
+        import base64
+        import re
+        import time
+
+        supabase = get_supabase_client()
+        alibaba_key = os.environ.get('ALIBABA_API_KEY')
+
+        # Update job → processing
+        supabase.table('generation_jobs').update({
+            'status': 'processing',
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        transcriptions = []
+
+        for media_file in media_files:
+            filename = media_file['filename']
+            audio_bytes = media_file['data']
+            print(f"[transcribe] Processing {filename} ({len(audio_bytes)} bytes)")
+
+            try:
+                # For video files, extract audio track using ffmpeg
+                ext = filename.rsplit('.', 1)[-1].lower()
+                if ext in ('mp4', 'webm', 'mov', 'avi'):
+                    import subprocess
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False) as vf:
+                        vf.write(audio_bytes)
+                        video_path = vf.name
+                    audio_path = video_path + '.wav'
+                    try:
+                        subprocess.run([
+                            'ffmpeg', '-i', video_path, '-vn', '-acodec', 'pcm_s16le',
+                            '-ar', '16000', '-ac', '1', audio_path, '-y'
+                        ], capture_output=True, timeout=120, check=True)
+                        with open(audio_path, 'rb') as af:
+                            audio_bytes = af.read()
+                    finally:
+                        for p in [video_path, audio_path]:
+                            if os.path.exists(p):
+                                os.remove(p)
+
+                # Base64-encode audio for DashScope API
+                audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+
+                # Determine audio format for the API
+                if ext in ('mp4', 'webm', 'mov', 'avi'):
+                    audio_format = 'wav'  # we converted to wav above
+                elif ext == 'mp3':
+                    audio_format = 'mp3'
+                elif ext in ('wav',):
+                    audio_format = 'wav'
+                elif ext == 'ogg':
+                    audio_format = 'ogg'
+                elif ext == 'm4a':
+                    audio_format = 'mp4'
+                else:
+                    audio_format = 'wav'
+
+                # Call DashScope Paraformer STT API
+                resp = http_requests.post(
+                    'https://dashscope-intl.aliyuncs.com/api/v1/services/audio/asr/transcription',
+                    headers={
+                        'Authorization': f'Bearer {alibaba_key}',
+                        'Content-Type': 'application/json',
+                    },
+                    json={
+                        "model": "paraformer-v2",
+                        "input": {
+                            "audio": f"data:audio/{audio_format};base64,{audio_b64}",
+                        },
+                        "parameters": {
+                            "language": "en",
+                        }
+                    },
+                    timeout=180,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+
+                # Extract transcript text from response
+                transcript = ''
+                output = result.get('output', {})
+                if isinstance(output, dict):
+                    # Try different response formats
+                    if 'sentence' in output:
+                        sentences = output['sentence']
+                        if isinstance(sentences, list):
+                            transcript = ' '.join(s.get('text', '') for s in sentences)
+                        elif isinstance(sentences, dict):
+                            transcript = sentences.get('text', '')
+                    elif 'text' in output:
+                        transcript = output['text']
+                    elif 'results' in output:
+                        for r in output['results']:
+                            transcript += r.get('text', '') + ' '
+
+                transcript = transcript.strip()
+                if not transcript:
+                    print(f"[transcribe] Warning: no transcript returned for {filename}")
+                    continue
+
+                # Try to associate with a slide number from filename
+                associated_slide = None
+                slide_match = re.search(r'(?:slide|s)[\s_-]*(\d+)', filename, re.IGNORECASE)
+                if slide_match:
+                    associated_slide = int(slide_match.group(1))
+
+                # Estimate duration from audio (rough: 16000 samples/sec for WAV)
+                duration_seconds = len(audio_bytes) / 32000  # rough estimate
+
+                transcriptions.append({
+                    'filename': filename,
+                    'transcript': transcript[:10000],  # cap at 10k chars per file
+                    'duration_seconds': round(duration_seconds, 1),
+                    'associated_slide': associated_slide,
+                })
+
+                print(f"[transcribe] {filename}: {len(transcript)} chars transcribed")
+
+            except Exception as file_err:
+                print(f"[transcribe] Warning: failed to transcribe {filename}: {file_err}")
+                continue
+
+        # Store transcriptions in generated_files metadata
+        file_record = supabase.table('generated_files').insert({
+            'file_type': 'scorm_transcription',
+            'file_url': '',  # no file URL, data is in metadata
+            'file_size': 0,
+            'metadata': json.dumps({
+                'transcriptions': transcriptions,
+                'course_id': course_id,
+                'media_files_processed': len(media_files),
+            })
+        }).execute()
+
+        # Update job → completed
+        supabase.table('generation_jobs').update({
+            'status': 'completed',
+            'result_file_id': file_record.data[0]['id'],
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        # Also cache in lms_course_transcriptions for the edge function
+        try:
+            supabase.table('lms_course_transcriptions').upsert({
+                'user_id': user_id,
+                'course_id': course_id,
+                'transcriptions': transcriptions,
+            }, on_conflict='user_id,course_id').execute()
+        except Exception as cache_err:
+            print(f"[transcribe] Warning: failed to cache transcriptions: {cache_err}")
+
+        print(f"[transcribe] Job {job_id} completed: {len(transcriptions)} files transcribed")
+
+    except Exception as err:
+        import traceback
+        print(f"[transcribe] Job {job_id} failed: {err}")
+        print(f"[transcribe] Traceback:\n{traceback.format_exc()}")
+        try:
+            supabase = get_supabase_client()
+            supabase.table('generation_jobs').update({
+                'status': 'failed',
+                'error_message': str(err)[:500],
+                'updated_at': datetime.now().isoformat()
+            }).eq('id', job_id).execute()
+        except Exception:
+            pass
+
+
+@app.route('/extract-scorm-cloud-media', methods=['POST'])
+def extract_scorm_cloud_media():
+    """Download a SCORM package from SCORM Cloud and transcribe audio/video content."""
+    try:
+        import requests as http_requests
+        import zipfile
+        import io
+
+        data = request.get_json()
+        course_id = data.get('course_id')
+        app_id = data.get('app_id')
+        secret_key = data.get('secret_key')
+        user_id = data.get('user_id')
+
+        if not course_id:
+            return jsonify({'error': 'course_id is required'}), 400
+        if not app_id or not secret_key:
+            return jsonify({'error': 'SCORM Cloud credentials are required'}), 400
+
+        alibaba_key = os.environ.get('ALIBABA_API_KEY')
+        if not alibaba_key:
+            return jsonify({'error': 'ALIBABA_API_KEY not configured (needed for transcription)'}), 500
+
+        # 1. Download the course ZIP from SCORM Cloud
+        print(f"[extract-scorm-media] Downloading ZIP for courseId={course_id}")
+        zip_resp = http_requests.get(
+            f"https://cloud.scorm.com/api/v2/courses/{course_id}/zip",
+            auth=(app_id, secret_key),
+            timeout=120,
+        )
+        if zip_resp.status_code == 404:
+            return jsonify({'error': 'Course not found in SCORM Cloud'}), 404
+        if zip_resp.status_code == 401:
+            return jsonify({'error': 'SCORM Cloud authentication failed'}), 401
+        if zip_resp.status_code != 200:
+            return jsonify({'error': f'Failed to download course (HTTP {zip_resp.status_code})'}), 500
+
+        zip_bytes = zip_resp.content
+        print(f"[extract-scorm-media] Downloaded {len(zip_bytes)} bytes")
+
+        # 2. Scan ZIP for media files
+        MEDIA_EXTENSIONS = {'.mp3', '.wav', '.ogg', '.m4a', '.mp4', '.webm', '.mov', '.avi'}
+        MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB per file
+
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        media_files = []
+
+        for info in zf.infolist():
+            ext = ('.' + info.filename.rsplit('.', 1)[-1].lower()) if '.' in info.filename else ''
+            if ext in MEDIA_EXTENSIONS and info.file_size < MAX_FILE_SIZE and not info.filename.startswith('__MACOSX'):
+                media_files.append({
+                    'filename': info.filename.rsplit('/', 1)[-1],  # just the filename, not path
+                    'data': zf.read(info.filename),
+                })
+
+        zf.close()
+
+        print(f"[extract-scorm-media] Found {len(media_files)} media files in {course_id}")
+
+        # 3. No media? Return immediately
+        if len(media_files) == 0:
+            return jsonify({
+                'success': True,
+                'media_files_found': 0,
+                'job_id': None,
+            })
+
+        # 4. Create async job and spawn worker
+        supabase = get_supabase_client()
+        job = supabase.table('generation_jobs').insert({
+            'job_type': 'scorm_transcription',
+            'status': 'pending',
+            'user_id': user_id,
+        }).execute()
+
+        job_id = job.data[0]['id']
+
+        threading.Thread(
+            target=_transcription_job_worker,
+            args=(job_id, media_files, course_id, user_id),
+            daemon=True
+        ).start()
+
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'media_files_found': len(media_files),
+        })
+
+    except Exception as e:
+        print(f"[extract-scorm-media] Error: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/push-to-scorm-cloud', methods=['POST'])
 def push_to_scorm_cloud():
     """Download a SCORM ZIP from storage and upload it to SCORM Cloud via API v2."""
