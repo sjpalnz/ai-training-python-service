@@ -294,15 +294,21 @@ def _clean_voiceover_script(text):
 
 
 def _parse_voiceover_scripts(response_text, expected_count):
-    """Parse [SLIDE N] markers from NBLM response into a list of per-slide scripts."""
+    """Parse [SLIDE N] markers from NBLM response into a list of per-slide scripts.
+
+    Matches by slide number (not occurrence order) so out-of-order responses
+    from NBLM are still correctly mapped to the right slide.
+    """
     import re
-    parts = re.split(r'\[SLIDE\s+\d+\]', response_text)
-    # First element is any text before [SLIDE 1], skip it
-    scripts = [_clean_voiceover_script(p.strip()) for p in parts[1:] if p.strip()]
-    # Pad or trim to match expected slide count
-    while len(scripts) < expected_count:
-        scripts.append('')
-    return scripts[:expected_count]
+    pattern = re.compile(r'\[SLIDE\s+(\d+)\](.*?)(?=\[SLIDE\s+\d+\]|$)', re.DOTALL)
+    scripts_by_num = {}
+    for num_str, content in pattern.findall(response_text):
+        num = int(num_str)
+        cleaned = _clean_voiceover_script(content.strip())
+        if cleaned:
+            scripts_by_num[num] = cleaned
+    # Build ordered list indexed 0 … expected_count-1
+    return [scripts_by_num.get(i + 1, '') for i in range(expected_count)]
 
 
 async def _generate_slide_deck_async(source_text, title, output_dir, options=None, existing_notebook_id=None, notebook_id_callback=None):
