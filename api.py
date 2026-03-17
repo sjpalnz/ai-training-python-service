@@ -922,10 +922,22 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
         job_output_dir = os.path.join(OUTPUT_DIR, f'slides_{job_id}')
         os.makedirs(job_output_dir, exist_ok=True)
 
+        # Callback: persist notebook_id as soon as it's known so a retry is possible even if we time out
+        def _save_notebook_id(nb_id):
+            try:
+                supabase.table('generation_jobs').update({
+                    'notebooklm_notebook_id': nb_id,
+                    'updated_at': datetime.now().isoformat()
+                }).eq('id', job_id).execute()
+                print(f"[NotebookLM] Saved notebook_id={nb_id} for job {job_id}")
+            except Exception as e:
+                print(f"[NotebookLM] Failed to save notebook_id (non-fatal): {e}")
+
         # Generate via NotebookLM
         notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck(
             source_text, title, job_output_dir,
-            options=options, existing_notebook_id=existing_notebook_id
+            options=options, existing_notebook_id=existing_notebook_id,
+            notebook_id_callback=_save_notebook_id
         )
 
         # Post-process PPTX: white strip across the bottom of every slide to cover NotebookLM branding

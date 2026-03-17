@@ -305,7 +305,7 @@ def _parse_voiceover_scripts(response_text, expected_count):
     return scripts[:expected_count]
 
 
-async def _generate_slide_deck_async(source_text, title, output_dir, options=None, existing_notebook_id=None):
+async def _generate_slide_deck_async(source_text, title, output_dir, options=None, existing_notebook_id=None, notebook_id_callback=None):
     """Create (or reuse) a NotebookLM notebook, generate slide deck, download PDF + PPTX + per-slide PNGs."""
     from notebooklm import NotebookLMClient
     from notebooklm.rpc.types import SlideDeckFormat, SlideDeckLength
@@ -327,6 +327,13 @@ async def _generate_slide_deck_async(source_text, title, output_dir, options=Non
     async with await NotebookLMClient.from_storage() as client:
         notebook_id = await _get_or_create_notebook_async(client, title, source_text, existing_notebook_id)
 
+        # Persist the notebook_id immediately so it can be used to retry if we time out later
+        if notebook_id_callback:
+            try:
+                notebook_id_callback(notebook_id)
+            except Exception as cb_err:
+                print(f"[NotebookLM] notebook_id_callback failed (non-fatal): {cb_err}")
+
         try:
             print(f"[NotebookLM] Generating slide deck: notebook={notebook_id}, format={slide_format}, length={slide_length}")
             status = await client.artifacts.generate_slide_deck(
@@ -338,8 +345,8 @@ async def _generate_slide_deck_async(source_text, title, output_dir, options=Non
             if getattr(status, 'is_failed', False) or not getattr(status, 'task_id', None):
                 raise Exception(f'NotebookLM slide deck generation rejected: {getattr(status, "error", None) or "no task_id returned"}')
 
-            # Allow up to 15 minutes
-            final = await client.artifacts.wait_for_completion(notebook_id, status.task_id, timeout=900.0)
+            # Allow up to 60 minutes
+            final = await client.artifacts.wait_for_completion(notebook_id, status.task_id, timeout=3600.0)
 
             if final.is_failed:
                 if final.is_rate_limited:
@@ -474,11 +481,11 @@ def generate_video(source_text, storyboard_json, output_path, options=None, exis
     )
 
 
-def generate_slide_deck(source_text, title, output_dir, options=None, existing_notebook_id=None):
+def generate_slide_deck(source_text, title, output_dir, options=None, existing_notebook_id=None, notebook_id_callback=None):
     """Sync wrapper: generate a slide deck PDF + PPTX + preview images from content."""
     loop = _get_event_loop()
     return loop.run_until_complete(
-        _generate_slide_deck_async(source_text, title, output_dir, options, existing_notebook_id)
+        _generate_slide_deck_async(source_text, title, output_dir, options, existing_notebook_id, notebook_id_callback)
     )
 
 
