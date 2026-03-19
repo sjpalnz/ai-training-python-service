@@ -247,19 +247,48 @@ def _pdf_to_images(pdf_path, output_dir):
     return paths
 
 
+def _extract_shape_texts(shape):
+    """Recursively extract all text from a shape, including tables and groups."""
+    texts = []
+    # Text frames (titles, body text, callouts, etc.)
+    if shape.has_text_frame:
+        for para in shape.text_frame.paragraphs:
+            text = para.text.strip()
+            if text:
+                texts.append(text)
+    # Tables
+    if shape.has_table:
+        for row in shape.table.rows:
+            row_texts = []
+            for cell in row.cells:
+                ct = cell.text.strip()
+                if ct:
+                    row_texts.append(ct)
+            if row_texts:
+                texts.append(' | '.join(row_texts))
+    # Group shapes — recurse into children
+    if shape.shape_type is not None:
+        try:
+            for child in shape.shapes:
+                texts.extend(_extract_shape_texts(child))
+        except (AttributeError, TypeError):
+            pass
+    return texts
+
+
 def _extract_slide_texts(pptx_path):
-    """Extract text content from each slide in a PPTX file."""
+    """Extract text content from each slide in a PPTX file.
+
+    Handles text frames, tables, and group shapes so voiceover prompts
+    get the full content of every slide.
+    """
     from pptx import Presentation
     prs = Presentation(pptx_path)
     slide_texts = []
     for slide in prs.slides:
         texts = []
         for shape in slide.shapes:
-            if shape.has_text_frame:
-                for para in shape.text_frame.paragraphs:
-                    text = para.text.strip()
-                    if text:
-                        texts.append(text)
+            texts.extend(_extract_shape_texts(shape))
         slide_texts.append('\n'.join(texts))
     return slide_texts
 
@@ -378,15 +407,25 @@ async def _generate_slide_deck_async(source_text, title, output_dir, options=Non
             # Generate voiceover scripts via NBLM chat
             voiceover_scripts = []
             try:
-                source_pptx = pptx_path or pdf_path  # use whichever is available
-                if source_pptx and os.path.exists(source_pptx) and pptx_path:
+                # Extract text from PPTX if available; fall back to generic labels
+                slide_texts = None
+                if pptx_path and os.path.exists(pptx_path):
                     slide_texts = _extract_slide_texts(pptx_path)
-                else:
-                    slide_texts = [f"Slide {i+1}" for i in range(len(slide_image_paths))]
+                    # Verify extraction returned meaningful content
+                    non_empty = sum(1 for t in slide_texts if t.strip())
+                    if non_empty == 0:
+                        print(f"[NotebookLM] PPTX text extraction returned all empty slides, falling back")
+                        slide_texts = None
+                    else:
+                        print(f"[NotebookLM] Extracted text from {non_empty}/{len(slide_texts)} slides")
+
+                if slide_texts is None:
+                    slide_texts = [f"(visual content)" for _ in range(len(slide_image_paths))]
 
                 prompt_parts = []
                 for i, text in enumerate(slide_texts):
-                    prompt_parts.append(f"Slide {i+1}:\n{text}")
+                    label = text.strip() if text.strip() else "(visual/graphical content — no extractable text)"
+                    prompt_parts.append(f"[SLIDE {i+1}]\n{label}")
 
                 # Build timing constraint if provided
                 target_time = opts.get('target_time') if opts else None
@@ -413,15 +452,21 @@ async def _generate_slide_deck_async(source_text, title, output_dir, options=Non
 
                 prompt = (
                     f"You have created a {len(slide_texts)}-slide presentation based on the uploaded source documents.\n"
-                    "Please write a voiceover narration script for a presenter to read aloud while presenting each slide.\n\n"
-                    "Here is the text content of each slide:\n\n"
+                    "Write a voiceover narration script that a presenter will read aloud while showing each slide.\n\n"
+                    "CRITICAL RULE: Each slide's narration must ONLY describe the topics and content that appear on THAT SPECIFIC slide. "
+                    "Do NOT reorganise, merge, or move content between slides. "
+                    "If a slide's text mentions Topic X, the narration for that slide must cover Topic X — not a different topic from another slide.\n\n"
+                    "Here is the exact text content extracted from each slide:\n\n"
                     + '\n\n'.join(prompt_parts) +
-                    "\n\nFormat your response with each slide's script preceded by [SLIDE N] on its own line:\n\n"
+                    "\n\nRespond with each slide's script preceded by [SLIDE N] on its own line:\n\n"
                     "[SLIDE 1]\n(narration for slide 1)\n\n"
                     "[SLIDE 2]\n(narration for slide 2)\n\n"
                     f"... and so on for all {len(slide_texts)} slides.\n\n"
-                    "Make the narration natural and conversational, suitable for a professional training presentation. "
-                    "Expand on the slide content using details from the source documents.\n\n"
+                    "Guidelines:\n"
+                    "- Stay faithful to each slide's content — narrate what is ON the slide, enriched with background from the source documents\n"
+                    "- Keep the same order as the slides — do not reorder topics\n"
+                    "- For slides with only visual/graphical content, describe the visual and its meaning based on the source material\n"
+                    "- Make the narration natural and conversational, suitable for a professional training presentation\n\n"
                     "IMPORTANT: This script will be read aloud by a text-to-speech system. "
                     "Do NOT include document reference numbers, citation markers, section numbers, "
                     "standard codes (e.g. 'AS/NZS 4801'), page references, footnote markers, "
