@@ -236,11 +236,22 @@ async def _generate_video_async(source_text, storyboard_json, output_path, optio
 
 
 def _pdf_to_images(pdf_path, output_dir):
-    """Convert each page of a PDF to a PNG image. Returns list of image file paths."""
+    """Convert each page of a PDF to a PNG image. Returns list of image file paths.
+
+    Paints a white strip across the bottom ~4 % of each slide to cover
+    the NotebookLM branding that is baked into the PDF.
+    """
     from pdf2image import convert_from_path
+    from PIL import ImageDraw
+
     images = convert_from_path(pdf_path, dpi=200, fmt='png')
     paths = []
     for i, img in enumerate(images):
+        # Cover NotebookLM logo / branding bar at bottom of slide
+        draw = ImageDraw.Draw(img)
+        strip_h = max(int(img.height * 0.04), 20)
+        draw.rectangle([0, img.height - strip_h, img.width, img.height], fill='white')
+
         img_path = os.path.join(output_dir, f'slide_{i+1}.png')
         img.save(img_path, 'PNG')
         paths.append(img_path)
