@@ -1,2 +1,2 @@
 [phases.setup]
-aptPkgs = ["poppler-utils", "ffmpeg", "libx264-dev"]
+aptPkgs = ["poppler-utils", "ffmpeg", "libx264-dev", "libreoffice"]

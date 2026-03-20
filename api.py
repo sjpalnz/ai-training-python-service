@@ -1076,6 +1076,8 @@ def generate_slides_content():
             'slide_length': data.get('slide_length', 'DEFAULT'),
             'target_time': data.get('target_time'),
             'max_time': data.get('max_time'),
+            'ppt_theme': data.get('ppt_theme'),
+            'ppt_template_url': data.get('ppt_template_url'),
         }
         existing_notebook_id = data.get('existing_notebook_id')
 

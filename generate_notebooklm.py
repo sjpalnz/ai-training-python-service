@@ -10,6 +10,9 @@ Requires NOTEBOOKLM_AUTH_JSON env var with Google session state.
 """
 import asyncio
 import os
+import subprocess
+import tempfile
+import urllib.request
 
 
 def _get_event_loop():
@@ -351,6 +354,87 @@ def _parse_voiceover_scripts(response_text, expected_count):
     return [scripts_by_num.get(i + 1, '') for i in range(expected_count)]
 
 
+THEME_INSTRUCTIONS = {
+    'corporate': 'Style the slides with a white background, deep navy headings (#1e3a5f), dark charcoal body text, and blue accents (#2c5aa0). Use clean professional fonts such as Calibri or Arial.',
+    'dark':      'Style the slides with a very dark background (#12121f), white headings, light blue-grey body text (#c8d2e6), and bright blue accents (#4facfe). Use modern sans-serif fonts.',
+    'slate':     'Style the slides with a light grey background (#f5f6f8), dark charcoal headings and body text (#2d3436), and blue accents (#639fff). Use clean minimal fonts.',
+    'clean':     'Style the slides with a white background, near-black headings (#1a1a2a), dark body text, and green accents (#30d158). Use crisp modern fonts.',
+    'vibrant':   'Style the slides with a white background, ocean blue headings (#0077b6), dark body text, and orange accents (#ff6b35). Use bold energetic fonts.',
+}
+
+
+async def _apply_theme_to_notebook(opts, client, notebook_id, tmp_dir):
+    """Apply presentation theme styling to a NotebookLM notebook.
+
+    For predefined themes: returns a style instruction string (no source added).
+    For custom .pptx templates: converts to PDF via LibreOffice, uploads as NBLM
+    source, and returns a matching instruction string.
+    Falls back to text extraction if LibreOffice conversion fails.
+    """
+    ppt_theme = opts.get('ppt_theme')
+    ppt_template_url = opts.get('ppt_template_url')
+
+    if ppt_template_url:
+        try:
+            tmp_pptx = os.path.join(tmp_dir, 'template.pptx')
+            print(f'[theme] Downloading template from {ppt_template_url}')
+            await asyncio.to_thread(urllib.request.urlretrieve, ppt_template_url, tmp_pptx)
+
+            # Convert to PDF via LibreOffice headless
+            print('[theme] Converting template to PDF via LibreOffice')
+            await asyncio.to_thread(
+                lambda: subprocess.run(
+                    ['libreoffice', '--headless', '--convert-to', 'pdf', '--outdir', tmp_dir, tmp_pptx],
+                    timeout=60,
+                    check=True,
+                    capture_output=True,
+                )
+            )
+
+            pdf_path = os.path.join(tmp_dir, 'template.pdf')
+            if not os.path.exists(pdf_path):
+                raise FileNotFoundError('LibreOffice did not produce a PDF')
+
+            print('[theme] Uploading template PDF as NBLM source')
+            with open(pdf_path, 'rb') as f:
+                await client.sources.add_file(
+                    notebook_id, f,
+                    mime_type='application/pdf',
+                    title='Template Style Reference',
+                    wait=True,
+                )
+            return 'Match the visual style of the uploaded template (added as a source). Replicate its color scheme, fonts, and layout structure.'
+
+        except Exception as e:
+            print(f'[theme] LibreOffice conversion failed ({e}), falling back to text extraction')
+            try:
+                from pptx import Presentation
+                prs = Presentation(tmp_pptx)
+                texts = []
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if hasattr(shape, 'text') and shape.text.strip():
+                            texts.append(shape.text.strip())
+                template_text = '\n'.join(texts[:200])  # cap at 200 snippets
+                if template_text:
+                    await client.sources.add_text(
+                        notebook_id,
+                        'Template Style Reference',
+                        template_text[:50000],
+                        wait=True,
+                    )
+                return 'Use the visual style suggested by the uploaded template reference text. Match its tone, structure, and implied color scheme.'
+            except Exception as e2:
+                print(f'[theme] Text fallback also failed ({e2}), skipping template styling')
+                return ''
+
+    if ppt_theme and ppt_theme in THEME_INSTRUCTIONS:
+        print(f'[theme] Applying predefined theme: {ppt_theme}')
+        return THEME_INSTRUCTIONS[ppt_theme]
+
+    return ''
+
+
 async def _generate_slide_deck_async(source_text, title, output_dir, options=None, existing_notebook_id=None, notebook_id_callback=None):
     """Create (or reuse) a NotebookLM notebook, generate slide deck, download PDF + PPTX + per-slide PNGs."""
     from notebooklm import NotebookLMClient
@@ -379,6 +463,15 @@ async def _generate_slide_deck_async(source_text, title, output_dir, options=Non
                 notebook_id_callback(notebook_id)
             except Exception as cb_err:
                 print(f"[NotebookLM] notebook_id_callback failed (non-fatal): {cb_err}")
+
+        # Apply theme styling
+        if opts.get('ppt_theme') or opts.get('ppt_template_url'):
+            try:
+                theme_instr = await _apply_theme_to_notebook(opts, client, notebook_id, output_dir)
+                if theme_instr:
+                    instructions = (instructions + '\n\n' + theme_instr) if instructions else theme_instr
+            except Exception as theme_err:
+                print(f"[theme] Failed to apply theme (non-fatal): {theme_err}")
 
         try:
             print(f"[NotebookLM] Generating slide deck: notebook={notebook_id}, format={slide_format}, length={slide_length}")
