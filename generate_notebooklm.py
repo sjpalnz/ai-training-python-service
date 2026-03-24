@@ -623,6 +623,26 @@ async def _generate_slide_deck_async(documents, title, output_dir, options=None,
                 print(f"[NotebookLM] Voiceover script generation failed ({e}), returning empty scripts")
                 voiceover_scripts = [''] * len(slide_image_paths)
 
+            # Add voiceover scripts back to the notebook as a source
+            if voiceover_scripts:
+                try:
+                    scripts_text = '\n\n'.join(
+                        f"[SLIDE {i + 1}]\n{script}"
+                        for i, script in enumerate(voiceover_scripts)
+                        if script and script.strip()
+                    )
+                    if scripts_text:
+                        await client.sources.add_text(
+                            notebook_id,
+                            'Voiceover Scripts',
+                            scripts_text,
+                            wait=True,
+                            wait_timeout=180.0,
+                        )
+                        print(f"[NotebookLM] Added voiceover scripts as source ({len(scripts_text)} chars)")
+                except Exception as e:
+                    print(f"[NotebookLM] Failed to add voiceover scripts as source (non-fatal): {e}")
+
             return notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts
 
         except Exception:
