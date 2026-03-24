@@ -910,13 +910,11 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
             .in_('id', document_ids) \
             .execute()
 
-        source_text = '\n\n'.join(
-            doc['extracted_text'][:10000] for doc in (docs_result.data or []) if doc.get('extracted_text')
-        )
-        if not source_text.strip():
+        documents = [doc for doc in (docs_result.data or []) if doc.get('extracted_text', '').strip()]
+        if not documents:
             raise Exception('No text content found in selected documents')
 
-        title = (options or {}).get('title') or (docs_result.data[0].get('filename', 'Slide Deck') if docs_result.data else 'Slide Deck')
+        title = (options or {}).get('title') or (documents[0].get('filename', 'Slide Deck'))
 
         # Create temp dir for this job's outputs
         job_output_dir = os.path.join(OUTPUT_DIR, f'slides_{job_id}')
@@ -935,7 +933,7 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
 
         # Generate via NotebookLM
         notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck(
-            source_text, title, job_output_dir,
+            documents, title, job_output_dir,
             options=options, existing_notebook_id=existing_notebook_id,
             notebook_id_callback=_save_notebook_id
         )

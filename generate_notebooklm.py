@@ -29,12 +29,39 @@ def _get_event_loop():
         return loop
 
 
-async def _get_or_create_notebook_async(client, title, source_text, existing_notebook_id=None):
+NBLM_CHUNK_SIZE = 48000  # safely under the 50,000 char NotebookLM source limit
+
+
+async def _add_documents_to_notebook(client, notebook_id, documents):
+    """Add each document as one or more text sources in the notebook.
+
+    documents: list of dicts with 'filename' and 'extracted_text' keys.
+    Documents longer than NBLM_CHUNK_SIZE are split into sequential chunks,
+    each added as a separate source so no content is lost.
+    """
+    for doc in documents:
+        text = doc.get('extracted_text', '')
+        name = doc.get('filename', 'Document')
+        if not text:
+            continue
+        if len(text) <= NBLM_CHUNK_SIZE:
+            await client.sources.add_text(notebook_id, name, text, wait=True, wait_timeout=180.0)
+            print(f"[NotebookLM] Added source '{name}' ({len(text)} chars)")
+        else:
+            chunks = [text[i:i + NBLM_CHUNK_SIZE] for i in range(0, len(text), NBLM_CHUNK_SIZE)]
+            for idx, chunk in enumerate(chunks):
+                chunk_title = f"{name} (part {idx + 1}/{len(chunks)})"
+                await client.sources.add_text(notebook_id, chunk_title, chunk, wait=True, wait_timeout=180.0)
+            print(f"[NotebookLM] Added '{name}' as {len(chunks)} chunks ({len(text)} chars total)")
+
+
+async def _get_or_create_notebook_async(client, title, documents, existing_notebook_id=None):
     """Return the notebook ID to use for generation.
 
+    documents: list of dicts with 'filename' and 'extracted_text'.
     If existing_notebook_id is provided and the notebook is still alive,
-    reuse it (adding the source only if it has none yet).  Otherwise create
-    a fresh notebook and add the source text.
+    reuse it (adding sources only if none exist yet). Otherwise create a
+    fresh notebook and add all documents as sources.
     """
     if existing_notebook_id:
         try:
@@ -43,16 +70,16 @@ async def _get_or_create_notebook_async(client, title, source_text, existing_not
             if sources:
                 print(f"[NotebookLM] Reusing notebook {existing_notebook_id} ({len(sources)} source(s) already present)")
                 return existing_notebook_id
-            # Notebook exists but source was never added — add it now
-            print(f"[NotebookLM] Reusing notebook {existing_notebook_id}, adding source")
-            await client.sources.add_text(existing_notebook_id, title, source_text[:50000], wait=True, wait_timeout=180.0)
+            # Notebook exists but sources were never added — add them now
+            print(f"[NotebookLM] Reusing notebook {existing_notebook_id}, adding sources")
+            await _add_documents_to_notebook(client, existing_notebook_id, documents)
             return existing_notebook_id
         except Exception as e:
             print(f"[NotebookLM] Existing notebook {existing_notebook_id} not usable ({e}), creating new one")
 
     nb = await client.notebooks.create(title)
     print(f"[NotebookLM] Created new notebook {nb.id}")
-    await client.sources.add_text(nb.id, title, source_text[:50000], wait=True, wait_timeout=180.0)
+    await _add_documents_to_notebook(client, nb.id, documents)
     return nb.id
 
 
@@ -87,7 +114,8 @@ async def _generate_podcast_async(source_text, storyboard_json, output_path, opt
     instructions = opts.get('instructions') or default_instructions
 
     async with await NotebookLMClient.from_storage() as client:
-        notebook_id = await _get_or_create_notebook_async(client, title, source_text, existing_notebook_id)
+        _docs = [{'filename': title, 'extracted_text': source_text}]
+        notebook_id = await _get_or_create_notebook_async(client, title, _docs, existing_notebook_id)
 
         try:
             # Generate audio podcast
@@ -142,7 +170,8 @@ async def _generate_infographic_async(source_text, storyboard_json, output_path,
     instructions = opts.get('instructions') or None
 
     async with await NotebookLMClient.from_storage() as client:
-        notebook_id = await _get_or_create_notebook_async(client, title, source_text, existing_notebook_id)
+        _docs = [{'filename': title, 'extracted_text': source_text}]
+        notebook_id = await _get_or_create_notebook_async(client, title, _docs, existing_notebook_id)
 
         try:
             # Generate infographic
@@ -210,7 +239,8 @@ async def _generate_video_async(source_text, storyboard_json, output_path, optio
     instructions = opts.get('instructions') or default_instructions
 
     async with await NotebookLMClient.from_storage() as client:
-        notebook_id = await _get_or_create_notebook_async(client, title, source_text, existing_notebook_id)
+        _docs = [{'filename': title, 'extracted_text': source_text}]
+        notebook_id = await _get_or_create_notebook_async(client, title, _docs, existing_notebook_id)
 
         try:
             status = await client.artifacts.generate_video(
@@ -435,7 +465,7 @@ async def _apply_theme_to_notebook(opts, client, notebook_id, tmp_dir):
     return ''
 
 
-async def _generate_slide_deck_async(source_text, title, output_dir, options=None, existing_notebook_id=None, notebook_id_callback=None):
+async def _generate_slide_deck_async(documents, title, output_dir, options=None, existing_notebook_id=None, notebook_id_callback=None):
     """Create (or reuse) a NotebookLM notebook, generate slide deck, download PDF + PPTX + per-slide PNGs."""
     from notebooklm import NotebookLMClient
     from notebooklm.rpc.types import SlideDeckFormat, SlideDeckLength
@@ -455,7 +485,7 @@ async def _generate_slide_deck_async(source_text, title, output_dir, options=Non
     instructions = opts.get('instructions') or None
 
     async with await NotebookLMClient.from_storage() as client:
-        notebook_id = await _get_or_create_notebook_async(client, title, source_text, existing_notebook_id)
+        notebook_id = await _get_or_create_notebook_async(client, title, documents, existing_notebook_id)
 
         # Persist the notebook_id immediately so it can be used to retry if we time out later
         if notebook_id_callback:
@@ -636,11 +666,14 @@ def generate_video(source_text, storyboard_json, output_path, options=None, exis
     )
 
 
-def generate_slide_deck(source_text, title, output_dir, options=None, existing_notebook_id=None, notebook_id_callback=None):
-    """Sync wrapper: generate a slide deck PDF + PPTX + preview images from content."""
+def generate_slide_deck(documents, title, output_dir, options=None, existing_notebook_id=None, notebook_id_callback=None):
+    """Sync wrapper: generate a slide deck PDF + PPTX + preview images from content.
+
+    documents: list of dicts with 'filename' and 'extracted_text' keys.
+    """
     loop = _get_event_loop()
     return loop.run_until_complete(
-        _generate_slide_deck_async(source_text, title, output_dir, options, existing_notebook_id, notebook_id_callback)
+        _generate_slide_deck_async(documents, title, output_dir, options, existing_notebook_id, notebook_id_callback)
     )
 
 
