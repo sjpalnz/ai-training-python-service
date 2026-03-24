@@ -916,7 +916,7 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
         if not source_text.strip():
             raise Exception('No text content found in selected documents')
 
-        title = docs_result.data[0].get('filename', 'Slide Deck') if docs_result.data else 'Slide Deck'
+        title = (options or {}).get('title') or (docs_result.data[0].get('filename', 'Slide Deck') if docs_result.data else 'Slide Deck')
 
         # Create temp dir for this job's outputs
         job_output_dir = os.path.join(OUTPUT_DIR, f'slides_{job_id}')
@@ -1026,6 +1026,7 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
                 'voiceover_scripts': voiceover_scripts,
                 'target_time': options.get('target_time') if options else None,
                 'max_time': options.get('max_time') if options else None,
+                'title': title,
             })
         }).execute()
 
@@ -1078,6 +1079,8 @@ def generate_slides_content():
             'max_time': data.get('max_time'),
             'ppt_theme': data.get('ppt_theme'),
             'ppt_template_url': data.get('ppt_template_url'),
+            'title': data.get('title'),
+            'slide_count': data.get('slide_count'),
         }
         existing_notebook_id = data.get('existing_notebook_id')
 
