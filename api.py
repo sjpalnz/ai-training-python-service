@@ -582,6 +582,7 @@ def process_documents():
             })
 
         # ── Manual file upload path (existing code) ───────────────────────────
+        extract_only = request.form.get('extract_only') == 'true'
         files = request.files.getlist('files')
 
         if not files or all(f.filename == '' for f in files):
@@ -642,6 +643,14 @@ def process_documents():
 
             if not extracted_text.strip():
                 return jsonify({'error': f'Could not extract text from {filename}. File may be empty or image-based.'}), 400
+
+            # extract_only mode: return text without saving to DB
+            if extract_only:
+                return jsonify({
+                    'success': True,
+                    'documents_processed': 1,
+                    'documents': [{'filename': filename, 'text': extracted_text}]
+                })
 
             # Delete existing record for same filename + client, then insert fresh
             drive_file_id = f"upload_{filename}"
