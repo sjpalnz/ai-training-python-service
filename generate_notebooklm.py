@@ -484,6 +484,12 @@ async def _generate_slide_deck_async(documents, title, output_dir, options=None,
     slide_length = len_map.get(opts.get('slide_length', ''))
     instructions = opts.get('instructions') or None
 
+    # Inject slide count into instructions — NBLM has no direct count parameter
+    slide_count = opts.get('slide_count')
+    if slide_count:
+        count_instr = f"Create exactly {slide_count} slides."
+        instructions = (instructions + '\n\n' + count_instr) if instructions else count_instr
+
     async with await NotebookLMClient.from_storage() as client:
         notebook_id = await _get_or_create_notebook_async(client, title, documents, existing_notebook_id)
 
