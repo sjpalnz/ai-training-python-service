@@ -50,7 +50,7 @@ async def _get_or_create_notebook_async(client, title, source_text, existing_not
         except Exception as e:
             print(f"[NotebookLM] Existing notebook {existing_notebook_id} not usable ({e}), creating new one")
 
-    nb = await client.notebooks.create(f"Course: {title}")
+    nb = await client.notebooks.create(title)
     print(f"[NotebookLM] Created new notebook {nb.id}")
     await client.sources.add_text(nb.id, title, source_text[:50000], wait=True, wait_timeout=180.0)
     return nb.id
