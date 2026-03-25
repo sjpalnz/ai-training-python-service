@@ -947,7 +947,7 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
             notebook_id_callback=_save_notebook_id
         )
 
-        # Post-process PPTX: white strip across the bottom of every slide to cover NotebookLM branding
+        # Post-process PPTX: white strip + speaker notes from voiceover scripts
         if pptx_path and os.path.exists(pptx_path):
             try:
                 from pptx import Presentation
@@ -956,7 +956,8 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
                 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
                 prs = Presentation(pptx_path)
                 strip_height = Inches(0.45)
-                for slide in prs.slides:
+                for i, slide in enumerate(prs.slides):
+                    # Branding strip
                     shape = slide.shapes.add_shape(
                         MSO_AUTO_SHAPE_TYPE.RECTANGLE,
                         left=Emu(0),
@@ -967,10 +968,17 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
                     shape.fill.solid()
                     shape.fill.fore_color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
                     shape.line.fill.background()
+                    # Speaker notes from voiceover script
+                    if voiceover_scripts and i < len(voiceover_scripts):
+                        script = (voiceover_scripts[i] or '').strip()
+                        if script:
+                            notes_slide = slide.notes_slide
+                            tf = notes_slide.notes_text_frame
+                            tf.text = script
                 prs.save(pptx_path)
-                print(f"[PPTX] Branding strip applied to {len(prs.slides)} slides")
+                print(f"[PPTX] Branding strip + speaker notes applied to {len(prs.slides)} slides")
             except Exception as e:
-                print(f"[PPTX] Branding strip failed ({e}), uploading original")
+                print(f"[PPTX] Post-processing failed ({e}), uploading original")
 
         # Update notebook ID for tracking
         supabase.table('generation_jobs').update({
