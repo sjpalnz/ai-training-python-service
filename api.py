@@ -1099,12 +1099,10 @@ def generate_slides_content():
         supabase = get_supabase_client()
 
         # Create job row (no course_id for standalone slide generation)
-        title = (options or {}).get('title') if options else None
         job = supabase.table('generation_jobs').insert({
             'job_type': 'slide_deck',
             'status': 'pending',
             'user_id': user_id,
-            'metadata': json.dumps({'title': title}) if title else None,
         }).execute()
 
         job_id = job.data[0]['id']
