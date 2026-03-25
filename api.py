@@ -449,6 +449,66 @@ def list_google_drive_files():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/check-drive-updates', methods=['POST'])
+def check_drive_updates():
+    """Compare stored drive_modified_time with current Drive modifiedTime for each imported doc."""
+    user_id = verify_jwt(request)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        supabase = get_supabase_client()
+
+        # Get all Drive-imported docs that have a stored modified time
+        docs_result = supabase.table('documents') \
+            .select('id, drive_file_id, drive_modified_time') \
+            .eq('client_id', user_id) \
+            .eq('source', 'google_drive') \
+            .not_.is_('drive_file_id', 'null') \
+            .not_.is_('drive_modified_time', 'null') \
+            .execute()
+
+        drive_docs = docs_result.data or []
+        if not drive_docs:
+            return jsonify({'updated_docs': []})
+
+        # Get refresh token
+        creds_result = supabase.table('user_google_credentials') \
+            .select('refresh_token') \
+            .eq('user_id', user_id) \
+            .limit(1) \
+            .execute()
+
+        if not creds_result.data or not creds_result.data[0].get('refresh_token'):
+            return jsonify({'updated_docs': []})
+
+        refresh_token = creds_result.data[0]['refresh_token']
+        drive_service = build_drive_service(refresh_token)
+
+        updated = []
+        for doc in drive_docs:
+            try:
+                meta = drive_service.files().get(
+                    fileId=doc['drive_file_id'],
+                    fields='modifiedTime'
+                ).execute()
+                current_modified = meta.get('modifiedTime', '')
+                stored_modified = doc.get('drive_modified_time', '')
+                if current_modified and stored_modified and current_modified > stored_modified:
+                    updated.append({
+                        'doc_id': doc['id'],
+                        'drive_file_id': doc['drive_file_id'],
+                        'current_modified_time': current_modified
+                    })
+            except Exception:
+                pass  # File may have been deleted from Drive
+
+        return jsonify({'updated_docs': updated})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # --- Document upload and text extraction ---
 
 @app.route('/process-documents', methods=['POST'])
@@ -490,12 +550,13 @@ def process_documents():
             # Fetch file metadata
             file_meta = drive_service.files().get(
                 fileId=google_drive_file_id,
-                fields='name, mimeType, size'
+                fields='name, mimeType, size, modifiedTime'
             ).execute()
 
             filename = file_meta.get('name', f'drive_{google_drive_file_id}')
             mime_type = file_meta.get('mimeType', '')
             file_size = int(file_meta.get('size', 0))
+            drive_modified_time = file_meta.get('modifiedTime')  # ISO 8601 string
 
             # Determine file extension + download method
             from io import BytesIO
@@ -556,7 +617,8 @@ def process_documents():
                 'drive_file_id': google_drive_file_id,
                 'source': 'google_drive',
                 'extracted_text': extracted_text,
-                'file_size': file_size or len(file_content)
+                'file_size': file_size or len(file_content),
+                'drive_modified_time': drive_modified_time
             }).execute()
 
             # Deduct 2 credits via RPC
