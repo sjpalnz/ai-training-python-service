@@ -1824,6 +1824,51 @@ def generate_scorm():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/generate-scorm-from-video', methods=['POST'])
+def generate_scorm_from_video():
+    """Generate SCORM 1.2 package wrapping an MP4 video."""
+    try:
+        data = request.json
+        title = data.get('title', 'Training Video')
+        video_url = data.get('video_url')
+        user_id = data.get('user_id')
+
+        if not video_url:
+            return jsonify({'error': 'video_url is required'}), 400
+        if not user_id:
+            return jsonify({'error': 'user_id is required'}), 400
+
+        from generate_scorm import generate_video_scorm_package
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"scorm_video_{timestamp}.zip"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+
+        generate_video_scorm_package(title, video_url, filepath)
+
+        # Upload to Supabase Storage
+        supabase = get_supabase_client()
+        storage_path = f"scorm/{user_id}_{timestamp}.zip"
+        with open(filepath, 'rb') as f:
+            supabase.storage.from_('course-files').upload(
+                path=storage_path, file=f.read(),
+                file_options={"content-type": "application/zip"}
+            )
+        download_url = supabase.storage.from_('course-files').get_public_url(storage_path)
+
+        # Clean up local file
+        try:
+            os.remove(filepath)
+        except Exception:
+            pass
+
+        return jsonify({'success': True, 'download_url': download_url, 'filename': filename})
+
+    except Exception as e:
+        print(f"[SCORM-Video] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/search-chunks', methods=['POST'])
 def search_chunks():
     """

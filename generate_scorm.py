@@ -1,5 +1,7 @@
 import os
 import zipfile
+import shutil
+import requests
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
@@ -285,3 +287,209 @@ var API = {
 
 window.API = API;
 '''
+
+
+def generate_video_scorm_package(title, video_url, output_path):
+    """
+    Generate a SCORM 1.2 package that wraps an MP4 video.
+
+    Args:
+        title:      Course title
+        video_url:  Public URL to the MP4 video file
+        output_path: Path where the .zip will be saved
+    """
+    temp_dir = '/tmp/scorm_video_temp'
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    # Download the video
+    print(f"[SCORM-Video] Downloading video from {video_url}")
+    resp = requests.get(video_url, stream=True, timeout=300)
+    resp.raise_for_status()
+    video_path = os.path.join(temp_dir, 'video.mp4')
+    with open(video_path, 'wb') as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+    print(f"[SCORM-Video] Video downloaded ({os.path.getsize(video_path)} bytes)")
+
+    # imsmanifest.xml
+    manifest_content = _video_manifest(title)
+    with open(os.path.join(temp_dir, 'imsmanifest.xml'), 'w') as f:
+        f.write(manifest_content)
+
+    # index.html
+    html_content = _video_html(title)
+    with open(os.path.join(temp_dir, 'index.html'), 'w') as f:
+        f.write(html_content)
+
+    # scorm_api.js (reuse existing)
+    api_content = generate_api_wrapper()
+    with open(os.path.join(temp_dir, 'scorm_api.js'), 'w') as f:
+        f.write(api_content)
+
+    # Create ZIP
+    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(temp_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, temp_dir)
+                zipf.write(file_path, arcname)
+
+    shutil.rmtree(temp_dir)
+    print(f"[SCORM-Video] Package created at {output_path}")
+    return output_path
+
+
+def _video_manifest(title):
+    """Generate SCORM 1.2 manifest for video package."""
+    manifest = Element('manifest', {
+        'identifier': 'video_course_manifest',
+        'version': '1.0',
+        'xmlns': 'http://www.imsproject.org/xsd/imscp_rootv1p1p2',
+        'xmlns:adlcp': 'http://www.adlnet.org/xsd/adlcp_rootv1p2',
+        'xmlns:xsi': 'http://www.w3.org/2001/XMLSchema-instance',
+    })
+
+    metadata = SubElement(manifest, 'metadata')
+    schema = SubElement(metadata, 'schema')
+    schema.text = 'ADL SCORM'
+    schemaversion = SubElement(metadata, 'schemaversion')
+    schemaversion.text = '1.2'
+
+    organizations = SubElement(manifest, 'organizations', {'default': 'video_org'})
+    organization = SubElement(organizations, 'organization', {'identifier': 'video_org'})
+    org_title = SubElement(organization, 'title')
+    org_title.text = title
+
+    item = SubElement(organization, 'item', {
+        'identifier': 'item_1',
+        'identifierref': 'resource_1',
+        'isvisible': 'true'
+    })
+    item_title = SubElement(item, 'title')
+    item_title.text = title
+
+    resources = SubElement(manifest, 'resources')
+    resource = SubElement(resources, 'resource', {
+        'identifier': 'resource_1',
+        'type': 'webcontent',
+        'adlcp:scormtype': 'sco',
+        'href': 'index.html'
+    })
+    SubElement(resource, 'file', {'href': 'index.html'})
+    SubElement(resource, 'file', {'href': 'scorm_api.js'})
+    SubElement(resource, 'file', {'href': 'video.mp4'})
+
+    rough_string = tostring(manifest, 'utf-8')
+    reparsed = minidom.parseString(rough_string)
+    return reparsed.toprettyxml(indent='  ')
+
+
+def _video_html(title):
+    """Generate HTML page that plays the embedded video."""
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <script src="scorm_api.js"></script>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0a;
+            color: #fff;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }}
+        h1 {{
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            text-align: center;
+            color: #e0e0e0;
+        }}
+        .video-container {{
+            width: 100%;
+            max-width: 960px;
+            border-radius: 12px;
+            overflow: hidden;
+            background: #000;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+        }}
+        video {{
+            width: 100%;
+            display: block;
+        }}
+        .controls {{
+            margin-top: 24px;
+            text-align: center;
+        }}
+        button {{
+            background: #2563eb;
+            color: #fff;
+            border: none;
+            padding: 14px 32px;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }}
+        button:hover {{ background: #1d4ed8; }}
+        button:disabled {{
+            background: #22c55e;
+            cursor: default;
+        }}
+        .status {{
+            margin-top: 12px;
+            font-size: 13px;
+            color: #888;
+        }}
+    </style>
+</head>
+<body>
+    <h1>{title}</h1>
+    <div class="video-container">
+        <video id="player" controls>
+            <source src="video.mp4" type="video/mp4">
+            Your browser does not support video playback.
+        </video>
+    </div>
+    <div class="controls">
+        <button id="completeBtn" onclick="completeCourse()">Mark as Complete</button>
+        <p class="status" id="status"></p>
+    </div>
+
+    <script>
+        // Initialize SCORM
+        if (window.API) {{
+            API.LMSInitialize("");
+            API.LMSSetValue("cmi.core.lesson_status", "incomplete");
+        }}
+
+        var player = document.getElementById("player");
+        player.addEventListener("ended", function() {{
+            document.getElementById("status").textContent = "Video finished. Click below to complete the course.";
+        }});
+
+        function completeCourse() {{
+            if (window.API) {{
+                API.LMSSetValue("cmi.core.lesson_status", "completed");
+                API.LMSSetValue("cmi.core.score.raw", "100");
+                API.LMSCommit("");
+            }}
+            var btn = document.getElementById("completeBtn");
+            btn.textContent = "Completed ✓";
+            btn.disabled = true;
+            document.getElementById("status").textContent = "Course marked as complete.";
+        }}
+    </script>
+</body>
+</html>'''
