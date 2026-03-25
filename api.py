@@ -2495,7 +2495,13 @@ def push_to_scorm_cloud():
         dl_resp = http_requests.get(scorm_url, timeout=60)
         if dl_resp.status_code != 200:
             return jsonify({'error': f'Failed to download SCORM package (HTTP {dl_resp.status_code})'}), 500
+        content_type = dl_resp.headers.get('Content-Type', '')
+        if 'zip' not in content_type and 'octet-stream' not in content_type:
+            print(f"[push-to-scorm-cloud] Unexpected Content-Type: {content_type}")
+            return jsonify({'error': f'Downloaded file is not a valid ZIP (Content-Type: {content_type})'}), 500
         zip_bytes = dl_resp.content
+        if len(zip_bytes) < 100:
+            return jsonify({'error': 'Downloaded SCORM package is too small — the file may be corrupted or expired'}), 500
         print(f"[push-to-scorm-cloud] Downloaded {len(zip_bytes)} bytes")
 
         # 2. Generate a courseId (alphanumeric + hyphens, max 200 chars)
@@ -2525,32 +2531,57 @@ def push_to_scorm_cloud():
         print(f"[push-to-scorm-cloud] Import job started: {import_job_id}")
 
         # 4. Poll for import completion (max 60s, every 3s)
+        if not import_job_id:
+            print("[push-to-scorm-cloud] No import_job_id returned — skipping poll")
+            return jsonify({
+                'success': True,
+                'course_id': course_id,
+                'import_job_id': None,
+                'status': 'UNKNOWN',
+                'message': 'Upload accepted but no import job ID returned. Check your LMS.',
+            })
+
         status = 'RUNNING'
-        for _ in range(20):
+        poll_failures = 0
+        for attempt in range(20):
             _time.sleep(3)
-            poll_resp = http_requests.get(
-                f"https://cloud.scorm.com/api/v2/courses/importJobs/{import_job_id}",
-                auth=(app_id, secret_key),
-                timeout=30,
-            )
-            if poll_resp.status_code == 200:
-                poll_data = poll_resp.json()
-                status = poll_data.get('status', 'UNKNOWN')
-                print(f"[push-to-scorm-cloud] Poll status: {status}")
-                if status in ('COMPLETE', 'ERROR', 'RUNNING'):
-                    if status != 'RUNNING':
+            try:
+                poll_resp = http_requests.get(
+                    f"https://cloud.scorm.com/api/v2/courses/importJobs/{import_job_id}",
+                    auth=(app_id, secret_key),
+                    timeout=30,
+                )
+                if poll_resp.status_code == 200:
+                    poll_data = poll_resp.json()
+                    status = poll_data.get('status', 'UNKNOWN')
+                    print(f"[push-to-scorm-cloud] Poll {attempt+1}: {status}")
+                    if status in ('COMPLETE', 'ERROR'):
                         break
+                else:
+                    poll_failures += 1
+                    print(f"[push-to-scorm-cloud] Poll {attempt+1} failed: HTTP {poll_resp.status_code}")
+                    if poll_failures >= 3:
+                        print("[push-to-scorm-cloud] Too many poll failures, stopping")
+                        break
+            except Exception as poll_err:
+                poll_failures += 1
+                print(f"[push-to-scorm-cloud] Poll {attempt+1} exception: {poll_err}")
+                if poll_failures >= 3:
+                    break
 
         if status == 'ERROR':
             return jsonify({'error': 'SCORM Cloud import failed — the package may be invalid'}), 500
 
-        print(f"[push-to-scorm-cloud] Done! courseId={course_id}, status={status}")
-        return jsonify({
+        result = {
             'success': True,
             'course_id': course_id,
             'import_job_id': import_job_id,
             'status': status,
-        })
+        }
+        if status == 'RUNNING':
+            result['message'] = 'Import started but not yet confirmed. Check your LMS.'
+        print(f"[push-to-scorm-cloud] Done! courseId={course_id}, status={status}")
+        return jsonify(result)
 
     except Exception as e:
         print(f"[push-to-scorm-cloud] Error: {e}")
