@@ -2651,6 +2651,344 @@ def push_to_scorm_cloud():
         return jsonify({'error': str(e)}), 500
 
 
+def _extract_slides_from_scorm_zip(zip_bytes, fallback_title='Course'):
+    """Shared helper: extract text slides from a SCORM ZIP file (bytes). Returns dict with slides, course_title, slide_count."""
+    import zipfile
+    import io
+    import xml.etree.ElementTree as ET
+    from bs4 import BeautifulSoup
+
+    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    filenames = zf.namelist()
+    html_files = []
+    course_title = fallback_title
+
+    manifest_names = [f for f in filenames if f.lower().endswith('imsmanifest.xml')]
+    if manifest_names:
+        try:
+            manifest_content = zf.read(manifest_names[0]).decode('utf-8', errors='ignore')
+            root = ET.fromstring(manifest_content)
+            for ns_prefix in ['{http://www.imsproject.org/xsd/imscp_rootv1p1p2}', '{http://www.imsglobal.org/xsd/imscp_v1p1}', '']:
+                title_el = root.find(f'.//{ns_prefix}title')
+                if title_el is not None and title_el.text:
+                    course_title = title_el.text.strip()
+                    break
+            for ns_prefix in ['{http://www.imsproject.org/xsd/imscp_rootv1p1p2}', '{http://www.imsglobal.org/xsd/imscp_v1p1}', '']:
+                resources = root.findall(f'.//{ns_prefix}resource')
+                if resources:
+                    for res in resources:
+                        href = res.get('href', '')
+                        if href and (href.endswith('.html') or href.endswith('.htm')):
+                            html_files.append(href)
+                    break
+        except Exception as e:
+            print(f"[extract-scorm] Warning: failed to parse manifest: {e}")
+
+    if not html_files:
+        html_files = [f for f in filenames if (f.endswith('.html') or f.endswith('.htm')) and not f.startswith('__MACOSX') and '/.' not in f]
+
+    slides = []
+    slide_num = 0
+    for html_file in html_files:
+        try:
+            html_content = zf.read(html_file).decode('utf-8', errors='ignore')
+            soup = BeautifulSoup(html_content, 'html.parser')
+            for tag in soup(['script', 'style', 'noscript', 'nav', 'header', 'footer']):
+                tag.decompose()
+            slide_divs = soup.find_all('div', class_=lambda c: c and 'slide' in str(c).lower()) if soup.find('div', class_=lambda c: c and 'slide' in str(c).lower()) else []
+            if slide_divs:
+                for div in slide_divs:
+                    slide_num += 1
+                    title_el = div.find(['h1', 'h2', 'h3'])
+                    title = title_el.get_text(strip=True) if title_el else f'Slide {slide_num}'
+                    if title_el: title_el.decompose()
+                    text = div.get_text(separator='\n', strip=True)
+                    if text.strip():
+                        slides.append({'number': slide_num, 'title': title[:200], 'text': text[:3000]})
+            else:
+                body = soup.find('body') or soup
+                headings = body.find_all(['h1', 'h2', 'h3'])
+                if headings:
+                    for heading in headings:
+                        slide_num += 1
+                        title = heading.get_text(strip=True)
+                        text_parts = []
+                        sibling = heading.find_next_sibling()
+                        while sibling and sibling.name not in ['h1', 'h2', 'h3']:
+                            t = sibling.get_text(separator='\n', strip=True)
+                            if t: text_parts.append(t)
+                            sibling = sibling.find_next_sibling()
+                        text = '\n'.join(text_parts)
+                        if title.strip() or text.strip():
+                            slides.append({'number': slide_num, 'title': title[:200] or f'Section {slide_num}', 'text': text[:3000]})
+                else:
+                    text = body.get_text(separator='\n', strip=True)
+                    if text.strip() and len(text.strip()) > 20:
+                        slide_num += 1
+                        page_title = html_file.rsplit('/', 1)[-1].replace('.html', '').replace('.htm', '').replace('_', ' ').replace('-', ' ').title()
+                        slides.append({'number': slide_num, 'title': page_title[:200], 'text': text[:3000]})
+        except Exception as e:
+            print(f"[extract-scorm] Warning: failed to parse {html_file}: {e}")
+    zf.close()
+    return {'slides': slides, 'course_title': course_title, 'slide_count': len(slides)}
+
+
+def _moodle_api_call(moodle_url, moodle_token, wsfunction, params=None):
+    """Call a Moodle REST web service function and return the parsed JSON response."""
+    import requests as http_requests
+    base = moodle_url.rstrip('/')
+    url = f"{base}/webservice/rest/server.php"
+    payload = {'wstoken': moodle_token, 'moodlewsrestformat': 'json', 'wsfunction': wsfunction}
+    if params:
+        payload.update(params)
+    resp = http_requests.post(url, data=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict) and data.get('exception'):
+        raise Exception(data.get('message', data.get('errorcode', 'Moodle API error')))
+    return data
+
+
+@app.route('/push-to-moodle', methods=['POST'])
+def push_to_moodle():
+    """Upload a SCORM ZIP to Moodle: upload to draft area, create course, return URL."""
+    try:
+        import requests as http_requests
+        import re
+
+        data = request.get_json()
+        scorm_url = data.get('scorm_url')
+        course_title = data.get('course_title', 'Untitled Course')
+        moodle_url = data.get('moodle_url')
+        moodle_token = data.get('moodle_token')
+
+        if not scorm_url:
+            return jsonify({'error': 'scorm_url is required'}), 400
+        if not moodle_url or not moodle_token:
+            return jsonify({'error': 'Moodle credentials are required'}), 400
+
+        base = moodle_url.rstrip('/')
+
+        # 1. Download SCORM ZIP
+        print(f"[push-to-moodle] Downloading SCORM ZIP from {scorm_url[:80]}...")
+        dl_resp = http_requests.get(scorm_url, timeout=120)
+        if dl_resp.status_code != 200:
+            return jsonify({'error': f'Failed to download SCORM ZIP (HTTP {dl_resp.status_code})'}), 500
+        zip_bytes = dl_resp.content
+        print(f"[push-to-moodle] Downloaded {len(zip_bytes)} bytes")
+
+        # 2. Upload ZIP to Moodle draft area
+        upload_url = f"{base}/webservice/upload.php?token={moodle_token}"
+        slug = re.sub(r'[^a-z0-9]+', '-', course_title.lower()).strip('-')[:50]
+        filename = f"{slug}.zip"
+        upload_resp = http_requests.post(upload_url, files={'file_1': (filename, zip_bytes, 'application/zip')}, timeout=120)
+        if upload_resp.status_code != 200:
+            return jsonify({'error': f'Moodle file upload failed (HTTP {upload_resp.status_code})'}), 500
+        upload_data = upload_resp.json()
+        if isinstance(upload_data, list) and len(upload_data) > 0:
+            item_id = upload_data[0].get('itemid')
+        elif isinstance(upload_data, dict):
+            item_id = upload_data.get('itemid')
+        else:
+            return jsonify({'error': 'Unexpected Moodle upload response'}), 500
+
+        if not item_id:
+            return jsonify({'error': 'Failed to get itemid from Moodle upload'}), 500
+
+        print(f"[push-to-moodle] Uploaded to draft area, itemid={item_id}")
+
+        # 3. Create a new course in Moodle
+        shortname = f"{slug}-{int(__import__('time').time())}"
+        course_data = _moodle_api_call(moodle_url, moodle_token, 'core_course_create_courses', {
+            'courses[0][fullname]': course_title,
+            'courses[0][shortname]': shortname,
+            'courses[0][categoryid]': 1,
+            'courses[0][summary]': f'SCORM course: {course_title}',
+            'courses[0][format]': 'singleactivity',
+            'courses[0][numsections]': 0,
+        })
+
+        if isinstance(course_data, list) and len(course_data) > 0:
+            new_course_id = course_data[0].get('id')
+        else:
+            return jsonify({'error': 'Failed to create Moodle course'}), 500
+
+        print(f"[push-to-moodle] Created course id={new_course_id}")
+
+        course_url = f"{base}/course/view.php?id={new_course_id}"
+
+        return jsonify({
+            'success': True,
+            'course_id': str(new_course_id),
+            'import_job_id': str(item_id),
+            'status': 'COMPLETE',
+            'course_url': course_url,
+            'message': f'Course created. SCORM package uploaded to draft area (itemid={item_id}). Add as SCORM activity in the course to complete setup.',
+        })
+
+    except Exception as e:
+        print(f"[push-to-moodle] Error: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/extract-moodle-course-content', methods=['POST'])
+def extract_moodle_course_content():
+    """Fetch course content from Moodle and extract text from SCORM packages."""
+    try:
+        import requests as http_requests
+
+        data = request.get_json()
+        course_id = data.get('course_id')
+        moodle_url = data.get('moodle_url')
+        moodle_token = data.get('moodle_token')
+
+        if not course_id or not moodle_url or not moodle_token:
+            return jsonify({'error': 'course_id, moodle_url, and moodle_token are required'}), 400
+
+        base = moodle_url.rstrip('/')
+
+        # Get course contents (sections + modules)
+        contents = _moodle_api_call(moodle_url, moodle_token, 'core_course_get_contents', {'courseid': course_id})
+
+        # Find SCORM modules and their packages
+        all_slides = []
+        course_title = f'Moodle Course {course_id}'
+
+        # Also try to get the course title
+        try:
+            courses = _moodle_api_call(moodle_url, moodle_token, 'core_course_get_courses', {'options[ids][0]': course_id})
+            if isinstance(courses, list) and courses:
+                course_title = courses[0].get('fullname', course_title)
+        except Exception:
+            pass
+
+        for section in (contents if isinstance(contents, list) else []):
+            for module in section.get('modules', []):
+                if module.get('modname') == 'scorm':
+                    # Try to download SCORM package
+                    for content_file in module.get('contents', []):
+                        file_url = content_file.get('fileurl')
+                        if file_url and file_url.endswith('.zip'):
+                            try:
+                                dl_url = f"{file_url}&token={moodle_token}" if '?' in file_url else f"{file_url}?token={moodle_token}"
+                                resp = http_requests.get(dl_url, timeout=120)
+                                if resp.status_code == 200:
+                                    result = _extract_slides_from_scorm_zip(resp.content, module.get('name', 'SCORM'))
+                                    all_slides.extend(result['slides'])
+                            except Exception as e:
+                                print(f"[extract-moodle] Warning: failed to download SCORM from {file_url}: {e}")
+
+                # Also extract text from label, page, and other content modules
+                elif module.get('modname') in ('label', 'page'):
+                    desc = module.get('description', '') or ''
+                    if desc.strip():
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(desc, 'html.parser')
+                        text = soup.get_text(separator='\n', strip=True)
+                        if text and len(text) > 20:
+                            all_slides.append({
+                                'number': len(all_slides) + 1,
+                                'title': module.get('name', f'Section {len(all_slides) + 1}')[:200],
+                                'text': text[:3000]
+                            })
+
+        # Re-number slides
+        for i, s in enumerate(all_slides):
+            s['number'] = i + 1
+
+        if not all_slides:
+            return jsonify({'error': 'No text content found in Moodle course. The course may be empty or use non-text content types.'}), 400
+
+        return jsonify({
+            'success': True,
+            'slides': all_slides,
+            'course_title': course_title,
+            'slide_count': len(all_slides),
+        })
+
+    except Exception as e:
+        print(f"[extract-moodle] Error: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/extract-moodle-media', methods=['POST'])
+def extract_moodle_media():
+    """Find and transcribe media files from a Moodle course's SCORM packages."""
+    try:
+        import requests as http_requests
+        import zipfile
+        import io
+        import uuid
+
+        data = request.get_json()
+        course_id = data.get('course_id')
+        moodle_url = data.get('moodle_url')
+        moodle_token = data.get('moodle_token')
+        user_id = data.get('user_id')
+
+        if not course_id or not moodle_url or not moodle_token or not user_id:
+            return jsonify({'error': 'course_id, moodle_url, moodle_token, and user_id are required'}), 400
+
+        base = moodle_url.rstrip('/')
+        contents = _moodle_api_call(moodle_url, moodle_token, 'core_course_get_contents', {'courseid': course_id})
+
+        MEDIA_EXTS = {'.mp3', '.wav', '.ogg', '.m4a', '.mp4', '.webm', '.mov', '.avi'}
+        media_files = []
+
+        for section in (contents if isinstance(contents, list) else []):
+            for module in section.get('modules', []):
+                if module.get('modname') == 'scorm':
+                    for content_file in module.get('contents', []):
+                        file_url = content_file.get('fileurl')
+                        if file_url and file_url.endswith('.zip'):
+                            try:
+                                dl_url = f"{file_url}&token={moodle_token}" if '?' in file_url else f"{file_url}?token={moodle_token}"
+                                resp = http_requests.get(dl_url, timeout=120)
+                                if resp.status_code == 200:
+                                    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+                                    for name in zf.namelist():
+                                        ext = os.path.splitext(name)[1].lower()
+                                        if ext in MEDIA_EXTS:
+                                            media_files.append({
+                                                'filename': name,
+                                                'data': zf.read(name),
+                                            })
+                                    zf.close()
+                            except Exception as e:
+                                print(f"[extract-moodle-media] Warning: failed to process {file_url}: {e}")
+
+        if not media_files:
+            return jsonify({'success': True, 'job_id': None, 'media_files_found': 0})
+
+        # Create async job and spawn transcription worker
+        job_id = str(uuid.uuid4())
+        supabase = get_supabase_client()
+        supabase.table('generation_jobs').insert({
+            'id': job_id,
+            'user_id': user_id,
+            'job_type': 'scorm_transcription',
+            'status': 'processing',
+        }).execute()
+
+        import threading
+        thread = threading.Thread(target=_transcription_job_worker, args=(job_id, media_files, course_id, user_id))
+        thread.daemon = True
+        thread.start()
+
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'media_files_found': len(media_files),
+        })
+
+    except Exception as e:
+        print(f"[extract-moodle-media] Error: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
