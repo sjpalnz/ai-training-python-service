@@ -1399,7 +1399,7 @@ def list_voices():
         return jsonify({'error': str(e)}), 500
 
 
-def _voiceover_job_worker(job_id, scripts, voice_id, user_id):
+def _voiceover_job_worker(job_id, scripts, voice_id, user_id, voice_provider='qwen'):
     """Background worker: generate voiceover audio for each slide, ZIP MP3s, upload."""
     try:
         import requests as http_requests
@@ -1412,6 +1412,7 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id):
 
         supabase = get_supabase_client()
         alibaba_key = os.environ.get('ALIBABA_API_KEY')
+        deepgram_key = os.environ.get('DEEPGRAM_API_KEY')
 
         # Update job → processing
         supabase.table('generation_jobs').update({
@@ -1422,7 +1423,32 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id):
         job_dir = os.path.join(OUTPUT_DIR, f'voiceover_{job_id}')
         os.makedirs(job_dir, exist_ok=True)
 
-        def synthesize_chunk(text_chunk, attempt=0):
+        use_deepgram = voice_provider == 'deepgram' and deepgram_key
+
+        def synthesize_chunk_deepgram(text_chunk, attempt=0):
+            """Call Deepgram Aura TTS API. Returns MP3 bytes directly."""
+            max_attempts = 4
+            try:
+                resp = http_requests.post(
+                    f'https://api.deepgram.com/v1/speak?model={voice_id}',
+                    headers={
+                        'Authorization': f'Token {deepgram_key}',
+                        'Content-Type': 'application/json',
+                    },
+                    json={"text": text_chunk},
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                return resp.content  # MP3 bytes
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    wait = (2 ** attempt) + 1
+                    print(f"[TTS-DG] Chunk retry {attempt+1}/{max_attempts}: {e}, waiting {wait}s")
+                    time.sleep(wait)
+                    return synthesize_chunk_deepgram(text_chunk, attempt + 1)
+                raise
+
+        def synthesize_chunk_qwen(text_chunk, attempt=0):
             """Call Qwen TTS synthesis API for a single chunk. Returns WAV bytes."""
             max_attempts = 4
             try:
@@ -1457,8 +1483,11 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id):
                     wait = (2 ** attempt) + 1
                     print(f"[TTS] Chunk retry {attempt+1}/{max_attempts}: {e}, waiting {wait}s")
                     time.sleep(wait)
-                    return synthesize_chunk(text_chunk, attempt + 1)
+                    return synthesize_chunk_qwen(text_chunk, attempt + 1)
                 raise
+
+        synthesize_chunk = synthesize_chunk_deepgram if use_deepgram else synthesize_chunk_qwen
+        print(f"[TTS] Using {'Deepgram' if use_deepgram else 'Qwen'} provider, voice: {voice_id}")
 
         slide_mp3_paths = []
 
@@ -1488,10 +1517,13 @@ def _voiceover_job_worker(job_id, scripts, voice_id, user_id):
                     idx = future_to_idx[future]
                     chunk_wavs[idx] = future.result()
 
-            # Concatenate WAV chunks using pydub
+            # Concatenate audio chunks using pydub
             combined = AudioSegment.empty()
-            for wav_bytes in chunk_wavs:
-                segment = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+            for audio_bytes in chunk_wavs:
+                if use_deepgram:
+                    segment = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
+                else:
+                    segment = AudioSegment.from_wav(io.BytesIO(audio_bytes))
                 combined += segment
 
             # Export as MP3
@@ -1759,6 +1791,7 @@ def generate_voiceover_audio():
         data = request.json or {}
         scripts = data.get('scripts', [])
         voice_id = data.get('voice_id')
+        voice_provider = data.get('voice_provider', 'qwen')
         user_id = data.get('user_id')
 
         if not scripts:
@@ -1782,7 +1815,7 @@ def generate_voiceover_audio():
         # Spawn background worker
         threading.Thread(
             target=_voiceover_job_worker,
-            args=(job_id, scripts, voice_id, user_id),
+            args=(job_id, scripts, voice_id, user_id, voice_provider),
             daemon=True
         ).start()
 
