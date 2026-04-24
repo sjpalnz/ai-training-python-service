@@ -1399,6 +1399,38 @@ def list_voices():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/preview-voice', methods=['POST'])
+def preview_voice():
+    """Generate a short TTS preview for a Deepgram stock voice. Returns MP3 audio."""
+    try:
+        import requests as http_requests
+        data = request.json or {}
+        voice_id = data.get('voice_id', 'aura-asteria-en')
+        text = data.get('text', 'Welcome to your training course.')
+
+        deepgram_key = os.environ.get('DEEPGRAM_API_KEY')
+        if not deepgram_key:
+            return jsonify({'error': 'DEEPGRAM_API_KEY not configured'}), 500
+
+        resp = http_requests.post(
+            f'https://api.deepgram.com/v1/speak?model={voice_id}',
+            headers={
+                'Authorization': f'Token {deepgram_key}',
+                'Content-Type': 'application/json',
+            },
+            json={"text": text},
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        from flask import Response as FlaskResponse
+        return FlaskResponse(resp.content, mimetype='audio/mpeg')
+
+    except Exception as e:
+        print(f"[preview-voice] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 def _voiceover_job_worker(job_id, scripts, voice_id, user_id, voice_provider='qwen'):
     """Background worker: generate voiceover audio for each slide, ZIP MP3s, upload."""
     try:
