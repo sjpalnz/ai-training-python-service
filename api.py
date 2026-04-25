@@ -963,10 +963,12 @@ def generate_notebooklm_content():
 
 
 def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing_notebook_id=None):
-    """Background worker: generate slide deck via NotebookLM, convert to preview images, upload all."""
+    """Background worker: generate slide deck via NotebookLM or Claude, convert to preview images, upload all."""
     try:
         import shutil
+        import time as _time
         from generate_notebooklm import generate_slide_deck
+        job_start = _time.time()
         supabase = get_supabase_client()
 
         # Update job → processing
@@ -1114,10 +1116,13 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
                 'target_time': options.get('target_time') if options else None,
                 'max_time': options.get('max_time') if options else None,
                 'title': title,
+                'slide_engine': options.get('slide_engine', 'notebooklm') if options else 'notebooklm',
+                'generation_time_secs': elapsed_secs,
             })
         }).execute()
 
         # Update job → completed
+        elapsed_secs = round(_time.time() - job_start, 1)
         supabase.table('generation_jobs').update({
             'status': 'completed',
             'result_file_id': file_record.data[0]['id'],
@@ -1127,7 +1132,8 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
         # Cleanup local temp files
         shutil.rmtree(job_output_dir, ignore_errors=True)
 
-        print(f"[NotebookLM] Slide deck generated: {len(slide_image_urls)} slides")
+        engine = options.get('slide_engine', 'notebooklm') if options else 'notebooklm'
+        print(f"[Slides] Deck generated via {engine}: {len(slide_image_urls)} slides in {elapsed_secs}s")
 
     except Exception as err:
         import traceback
