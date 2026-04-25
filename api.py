@@ -1166,18 +1166,21 @@ def generate_slides_content():
         data = request.json or {}
         document_ids = data.get('document_ids', [])
         user_id = data.get('user_id')
+        # Read options from nested object or flat params (backwards compat)
+        opts = data.get('options') or {}
         options = {
-            'instructions': data.get('instructions'),
-            'slide_format': data.get('slide_format', 'DETAILED_DECK'),
-            'slide_length': data.get('slide_length', 'DEFAULT'),
-            'target_time': data.get('target_time'),
-            'max_time': data.get('max_time'),
-            'ppt_theme': data.get('ppt_theme'),
-            'ppt_template_url': data.get('ppt_template_url'),
-            'title': data.get('title'),
-            'slide_count': data.get('slide_count'),
+            'slide_engine': opts.get('slide_engine', data.get('slide_engine', 'notebooklm')),
+            'instructions': opts.get('instructions', data.get('instructions')),
+            'slide_format': opts.get('slide_format', data.get('slide_format', 'DETAILED_DECK')),
+            'slide_length': opts.get('slide_length', data.get('slide_length', 'DEFAULT')),
+            'target_time': opts.get('target_time', data.get('target_time')),
+            'max_time': opts.get('max_time', data.get('max_time')),
+            'ppt_theme': opts.get('ppt_theme', data.get('ppt_theme')),
+            'ppt_template_url': opts.get('ppt_template_url', data.get('ppt_template_url')),
+            'title': opts.get('title', data.get('title')),
+            'slide_count': opts.get('slide_count', data.get('slide_count')),
         }
-        existing_notebook_id = data.get('existing_notebook_id')
+        existing_notebook_id = opts.get('existing_notebook_id', data.get('existing_notebook_id'))
 
         if not document_ids:
             return jsonify({'error': 'document_ids is required'}), 400
