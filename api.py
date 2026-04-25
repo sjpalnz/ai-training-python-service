@@ -1002,12 +1002,22 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
             except Exception as e:
                 print(f"[NotebookLM] Failed to save notebook_id (non-fatal): {e}")
 
-        # Generate via NotebookLM
-        notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck(
-            documents, title, job_output_dir,
-            options=options, existing_notebook_id=existing_notebook_id,
-            notebook_id_callback=_save_notebook_id
-        )
+        # Generate via selected engine
+        engine = options.get('slide_engine', 'notebooklm')
+
+        if engine == 'claude':
+            from generate_claude_slides import generate_slide_deck_claude
+            print(f"[Slides] Using Claude engine for job {job_id}")
+            notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck_claude(
+                documents, title, job_output_dir, options=options
+            )
+        else:
+            print(f"[Slides] Using NotebookLM engine for job {job_id}")
+            notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck(
+                documents, title, job_output_dir,
+                options=options, existing_notebook_id=existing_notebook_id,
+                notebook_id_callback=_save_notebook_id
+            )
 
         # Post-process PPTX: white strip + speaker notes from voiceover scripts
         if pptx_path and os.path.exists(pptx_path):
