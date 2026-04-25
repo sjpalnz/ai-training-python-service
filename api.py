@@ -1062,14 +1062,16 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-        # Upload PDF to Supabase Storage
-        pdf_storage_path = f"slide_decks/{job_id}_{timestamp}.pdf"
-        with open(pdf_path, 'rb') as f:
-            supabase.storage.from_('course-files').upload(
-                path=pdf_storage_path, file=f.read(),
-                file_options={"content-type": "application/pdf"}
-            )
-        pdf_url = supabase.storage.from_('course-files').get_public_url(pdf_storage_path)
+        # Upload PDF to Supabase Storage (may not exist for Claude engine)
+        pdf_url = None
+        if pdf_path and os.path.exists(pdf_path):
+            pdf_storage_path = f"slide_decks/{job_id}_{timestamp}.pdf"
+            with open(pdf_path, 'rb') as f:
+                supabase.storage.from_('course-files').upload(
+                    path=pdf_storage_path, file=f.read(),
+                    file_options={"content-type": "application/pdf"}
+                )
+            pdf_url = supabase.storage.from_('course-files').get_public_url(pdf_storage_path)
 
         # Upload PPTX if available
         pptx_url = None
@@ -1099,7 +1101,7 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
 
         # Use PPTX URL as primary file_url, fall back to PDF
         primary_url = pptx_url or pdf_url
-        primary_size = pptx_size or os.path.getsize(pdf_path)
+        primary_size = pptx_size or (os.path.getsize(pdf_path) if pdf_path and os.path.exists(pdf_path) else 0)
 
         # Save to generated_files table
         file_record = supabase.table('generated_files').insert({

@@ -44,19 +44,31 @@ def _call_claude(prompt, max_tokens=16000):
         },
         timeout=300,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        error_body = resp.text[:500]
+        print(f'[Claude Slides] API error ({resp.status_code}): {error_body}')
+        resp.raise_for_status()
     data = resp.json()
+    print(f'[Claude Slides] API call completed: {data.get("usage", {})}')
     return data['content'][0]['text']
 
 
 def _pptx_to_pdf(pptx_path, output_dir):
-    """Convert PPTX to PDF using LibreOffice headless."""
-    subprocess.run(
-        ['soffice', '--headless', '--convert-to', 'pdf', '--outdir', output_dir, pptx_path],
-        check=True, timeout=120, capture_output=True,
-    )
-    base = os.path.splitext(os.path.basename(pptx_path))[0]
-    return os.path.join(output_dir, f'{base}.pdf')
+    """Convert PPTX to PDF using LibreOffice headless. Returns PDF path or None on failure."""
+    try:
+        subprocess.run(
+            ['soffice', '--headless', '--convert-to', 'pdf', '--outdir', output_dir, pptx_path],
+            check=True, timeout=120, capture_output=True,
+        )
+        base = os.path.splitext(os.path.basename(pptx_path))[0]
+        pdf_path = os.path.join(output_dir, f'{base}.pdf')
+        if os.path.exists(pdf_path):
+            return pdf_path
+        print('[Claude Slides] LibreOffice produced no PDF output')
+        return None
+    except Exception as e:
+        print(f'[Claude Slides] PPTX→PDF conversion failed: {e}')
+        return None
 
 
 def generate_slide_deck_claude(documents, title, output_dir, options=None):
@@ -190,8 +202,15 @@ Rules:
 
     # ── Phase 3: Generate preview PNGs ─────────────────────────────────────
     pdf_path = _pptx_to_pdf(pptx_path, output_dir)
-    slide_image_paths = _pdf_to_images(pdf_path, output_dir)
-    print(f'[Claude Slides] {len(slide_image_paths)} preview PNGs generated')
+    slide_image_paths = []
+    if pdf_path:
+        try:
+            slide_image_paths = _pdf_to_images(pdf_path, output_dir)
+            print(f'[Claude Slides] {len(slide_image_paths)} preview PNGs generated')
+        except Exception as e:
+            print(f'[Claude Slides] PNG generation failed: {e}')
+    else:
+        print('[Claude Slides] Skipping preview PNGs (no PDF available)')
 
     # ── Phase 4: Generate voiceover scripts ────────────────────────────────
     slide_texts = _extract_slide_texts(pptx_path)
