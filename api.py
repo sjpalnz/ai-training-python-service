@@ -1104,6 +1104,7 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
         primary_size = pptx_size or (os.path.getsize(pdf_path) if pdf_path and os.path.exists(pdf_path) else 0)
 
         # Save to generated_files table
+        elapsed_secs = round(_time.time() - job_start, 1)
         file_record = supabase.table('generated_files').insert({
             'file_type': 'slide_deck',
             'file_url': primary_url,
@@ -1124,7 +1125,6 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
         }).execute()
 
         # Update job → completed
-        elapsed_secs = round(_time.time() - job_start, 1)
         supabase.table('generation_jobs').update({
             'status': 'completed',
             'result_file_id': file_record.data[0]['id'],
