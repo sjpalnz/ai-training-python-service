@@ -1004,8 +1004,9 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
             except Exception as e:
                 print(f"[NotebookLM] Failed to save notebook_id (non-fatal): {e}")
 
-        # Generate via selected engine
+        # Generate via selected engine, with automatic fallback
         engine = options.get('slide_engine', 'notebooklm')
+        used_fallback = False
 
         if engine == 'claude':
             from generate_claude_slides import generate_slide_deck_claude
@@ -1015,11 +1016,20 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
             )
         else:
             print(f"[Slides] Using NotebookLM engine for job {job_id}")
-            notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck(
-                documents, title, job_output_dir,
-                options=options, existing_notebook_id=existing_notebook_id,
-                notebook_id_callback=_save_notebook_id
-            )
+            try:
+                notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck(
+                    documents, title, job_output_dir,
+                    options=options, existing_notebook_id=existing_notebook_id,
+                    notebook_id_callback=_save_notebook_id
+                )
+            except Exception as nblm_err:
+                print(f"[Slides] NotebookLM failed: {nblm_err} — falling back to Claude")
+                from generate_claude_slides import generate_slide_deck_claude
+                used_fallback = True
+                engine = 'claude'
+                notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck_claude(
+                    documents, title, job_output_dir, options=options
+                )
 
         # Post-process PPTX: white strip + speaker notes from voiceover scripts
         if pptx_path and os.path.exists(pptx_path):
@@ -1119,7 +1129,8 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
                 'target_time': options.get('target_time') if options else None,
                 'max_time': options.get('max_time') if options else None,
                 'title': title,
-                'slide_engine': options.get('slide_engine', 'notebooklm') if options else 'notebooklm',
+                'slide_engine': engine,
+                'used_fallback': used_fallback,
                 'generation_time_secs': elapsed_secs,
             })
         }).execute()
