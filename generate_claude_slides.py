@@ -47,7 +47,12 @@ def _call_claude(prompt, max_tokens=16000):
     if not resp.ok:
         error_body = resp.text[:500]
         print(f'[Claude Slides] API error ({resp.status_code}): {error_body}')
-        resp.raise_for_status()
+        try:
+            err_json = resp.json()
+            err_msg = err_json.get('error', {}).get('message', error_body)
+        except Exception:
+            err_msg = error_body
+        raise Exception(f'Claude API error ({resp.status_code}): {err_msg}')
     data = resp.json()
     print(f'[Claude Slides] API call completed: {data.get("usage", {})}')
     return data['content'][0]['text']
@@ -117,9 +122,10 @@ def generate_slide_deck_claude(documents, title, output_dir, options=None):
 
     user_instruction = f'\nAdditional instructions: {instructions}' if instructions else ''
 
+    safe_title = (title or 'Training Presentation').replace('"', '\\"')
     prompt = f"""You are an expert instructional designer creating a professional training presentation.
 
-Based on the source documents below, create a slide deck titled "{title}".
+Based on the source documents below, create a slide deck titled "{safe_title}".
 
 --- SOURCE DOCUMENTS ---
 {doc_text}
@@ -132,12 +138,12 @@ Based on the source documents below, create a slide deck titled "{title}".
 
 Return ONLY valid JSON in this exact format (no markdown, no commentary):
 {{
-  "title": "{title}",
+  "title": "{safe_title}",
   "slides": [
     {{
       "type": "title",
-      "title": "{title}",
-      "content": "{title}"
+      "title": "{safe_title}",
+      "content": "{safe_title}"
     }},
     {{
       "type": "content",
