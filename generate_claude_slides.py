@@ -81,17 +81,23 @@ def _generate_preview_images(course_data, output_dir, theme_id='corporate'):
     from PIL import Image, ImageDraw, ImageFont
 
     theme = THEMES.get(theme_id, THEMES['corporate'])
-    bg_hex = theme.get('slide_bg', '#ffffff')
-    heading_hex = theme.get('heading_color', '#1a1a1a')
-    text_hex = theme.get('text_color', '#333333')
 
-    def hex_to_rgb(h):
-        h = str(h).lstrip('#')
-        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+    def to_rgb(val, default=(255, 255, 255)):
+        if val is None:
+            return default
+        # RGBColor objects from python-pptx have .red, .green, .blue attrs
+        if hasattr(val, 'red'):
+            return (val.red, val.green, val.blue)
+        # Hex string
+        h = str(val).lstrip('#')
+        try:
+            return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        except (ValueError, IndexError):
+            return default
 
-    bg_rgb = hex_to_rgb(bg_hex)
-    heading_rgb = hex_to_rgb(heading_hex)
-    text_rgb = hex_to_rgb(text_hex)
+    bg_rgb = to_rgb(theme.get('slide_bg'), (255, 255, 255))
+    heading_rgb = to_rgb(theme.get('heading_color'), (30, 58, 95))
+    text_rgb = to_rgb(theme.get('text_color'), (51, 51, 51))
 
     W, H = 960, 720
     paths = []
