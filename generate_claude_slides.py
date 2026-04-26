@@ -191,10 +191,33 @@ Rules:
         try:
             tmpl_resp = requests.get(template_url, timeout=30)
             tmpl_resp.raise_for_status()
-            with open(template_path, 'wb') as f:
+            raw_path = os.path.join(output_dir, 'template_raw')
+            with open(raw_path, 'wb') as f:
                 f.write(tmpl_resp.content)
+            # Convert .potx to .pptx — python-pptx rejects template content type
+            import zipfile
+            if zipfile.is_zipfile(raw_path):
+                with zipfile.ZipFile(raw_path, 'r') as zin:
+                    content_type_xml = zin.read('[Content_Types].xml').decode('utf-8')
+                    if 'presentationml.template' in content_type_xml:
+                        content_type_xml = content_type_xml.replace(
+                            'presentationml.template.main+xml',
+                            'presentationml.presentation.main+xml'
+                        )
+                        with zipfile.ZipFile(template_path, 'w') as zout:
+                            for item in zin.infolist():
+                                data = zin.read(item.filename)
+                                if item.filename == '[Content_Types].xml':
+                                    data = content_type_xml.encode('utf-8')
+                                zout.writestr(item, data)
+                        print('[Claude Slides] Converted .potx template to .pptx')
+                    else:
+                        shutil.copy2(raw_path, template_path)
+            else:
+                shutil.copy2(raw_path, template_path)
+            os.remove(raw_path)
         except Exception as e:
-            print(f'[Claude Slides] Failed to download template: {e}')
+            print(f'[Claude Slides] Failed to download/convert template: {e}')
             template_path = None
 
     pptx_path = os.path.join(output_dir, 'slides.pptx')
