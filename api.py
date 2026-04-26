@@ -1431,14 +1431,18 @@ def list_voices():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/preview-voice', methods=['POST'])
+@app.route('/preview-voice', methods=['GET', 'POST'])
 def preview_voice():
     """Generate a short TTS preview for a Deepgram stock voice. Returns MP3 audio."""
     try:
         import requests as http_requests
-        data = request.json or {}
-        voice_id = data.get('voice_id', 'aura-asteria-en')
-        text = data.get('text', 'Welcome to your training course.')
+        if request.method == 'GET':
+            voice_id = request.args.get('voice_id', 'aura-asteria-en')
+            text = 'Welcome to your training course. This is a preview of the selected voice.'
+        else:
+            data = request.json or {}
+            voice_id = data.get('voice_id', 'aura-asteria-en')
+            text = data.get('text', 'Welcome to your training course.')
 
         deepgram_key = os.environ.get('DEEPGRAM_API_KEY')
         if not deepgram_key:
@@ -1456,7 +1460,10 @@ def preview_voice():
         resp.raise_for_status()
 
         from flask import Response as FlaskResponse
-        return FlaskResponse(resp.content, mimetype='audio/mpeg')
+        return FlaskResponse(resp.content, mimetype='audio/mpeg', headers={
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=3600',
+        })
 
     except Exception as e:
         print(f"[preview-voice] Error: {e}")
