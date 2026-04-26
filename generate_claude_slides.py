@@ -12,7 +12,7 @@ import requests
 import subprocess
 import shutil
 
-from generate_powerpoint import generate_powerpoint_file
+from generate_powerpoint import generate_powerpoint_file, THEMES
 from generate_notebooklm import (
     _pdf_to_images,
     _extract_slide_texts,
@@ -74,6 +74,74 @@ def _pptx_to_pdf(pptx_path, output_dir):
     except Exception as e:
         print(f'[Claude Slides] PPTX→PDF conversion failed: {e}')
         return None
+
+
+def _generate_preview_images(course_data, output_dir, theme_id='corporate'):
+    """Generate simple slide preview PNGs using Pillow when LibreOffice is unavailable."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    theme = THEMES.get(theme_id, THEMES['corporate'])
+    bg_hex = theme.get('slide_bg', '#ffffff')
+    heading_hex = theme.get('heading_color', '#1a1a1a')
+    text_hex = theme.get('text_color', '#333333')
+
+    def hex_to_rgb(h):
+        h = str(h).lstrip('#')
+        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+    bg_rgb = hex_to_rgb(bg_hex)
+    heading_rgb = hex_to_rgb(heading_hex)
+    text_rgb = hex_to_rgb(text_hex)
+
+    W, H = 960, 720
+    paths = []
+
+    for i, slide_data in enumerate(course_data.get('slides', [])):
+        img = Image.new('RGB', (W, H), bg_rgb)
+        draw = ImageDraw.Draw(img)
+
+        slide_type = slide_data.get('type', 'content')
+        title_text = slide_data.get('title', '')
+        bullets = slide_data.get('bullets', [])
+        content = slide_data.get('content', '')
+
+        try:
+            title_font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 28)
+            body_font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 18)
+        except (OSError, IOError):
+            title_font = ImageFont.load_default()
+            body_font = ImageFont.load_default()
+
+        if slide_type == 'title':
+            draw.text((W // 2, H // 2 - 30), title_text, fill=heading_rgb, font=title_font, anchor='mm')
+            if content and content != title_text:
+                draw.text((W // 2, H // 2 + 20), content[:80], fill=text_rgb, font=body_font, anchor='mm')
+        else:
+            draw.text((50, 40), title_text, fill=heading_rgb, font=title_font)
+            y = 100
+            for bullet in bullets[:8]:
+                line = f'•  {bullet}'
+                # Word wrap at ~70 chars
+                while len(line) > 70:
+                    wrap_at = line.rfind(' ', 0, 70)
+                    if wrap_at == -1:
+                        wrap_at = 70
+                    draw.text((60, y), line[:wrap_at], fill=text_rgb, font=body_font)
+                    y += 28
+                    line = '    ' + line[wrap_at:].strip()
+                draw.text((60, y), line, fill=text_rgb, font=body_font)
+                y += 34
+                if y > H - 60:
+                    break
+
+        # Slide number
+        draw.text((W - 40, H - 30), str(i + 1), fill=(*text_rgb[:3],), font=body_font, anchor='mm')
+
+        img_path = os.path.join(output_dir, f'slide_{i + 1}.png')
+        img.save(img_path, 'PNG')
+        paths.append(img_path)
+
+    return paths
 
 
 def generate_slide_deck_claude(documents, title, output_dir, options=None):
@@ -164,12 +232,16 @@ Return ONLY valid JSON in this exact format (no markdown, no commentary):
 }}
 
 Rules:
-- First slide must be type "title" with the presentation title
-- Last slide should be type "summary" with key takeaways
-- All other slides should be type "content" with a title and bullets array
-- Each bullet should be a complete, informative sentence
+- First slide MUST be type "title" with the presentation title
+- Last slide MUST be type "summary" with key takeaways
+- All other slides MUST be type "content" with a title and bullets array
+- Keep each bullet to 1-2 lines maximum (under 15 words per bullet)
+- Use 3-6 bullets per slide — do not overcrowd
+- Use clear, concise language — not full paragraphs
+- Slide titles should be short and descriptive (under 8 words)
 - Content must be grounded in the source documents — do not invent facts
-- Organise content logically with clear section progression"""
+- Organise content logically with clear section progression
+- Do NOT include slide numbers in titles"""
 
     print(f'[Claude Slides] Generating slide content for "{title}" ({len(documents)} docs, ~{len(doc_text)} chars)')
     response_text = _call_claude(prompt)
@@ -230,16 +302,19 @@ Rules:
     print(f'[Claude Slides] PPTX generated: {pptx_path}')
 
     # ── Phase 3: Generate preview PNGs ─────────────────────────────────────
+    # Try LibreOffice first, fall back to Pillow-based previews
     pdf_path = _pptx_to_pdf(pptx_path, output_dir)
     slide_image_paths = []
     if pdf_path:
         try:
             slide_image_paths = _pdf_to_images(pdf_path, output_dir)
-            print(f'[Claude Slides] {len(slide_image_paths)} preview PNGs generated')
+            print(f'[Claude Slides] {len(slide_image_paths)} preview PNGs via LibreOffice')
         except Exception as e:
-            print(f'[Claude Slides] PNG generation failed: {e}')
-    else:
-        print('[Claude Slides] Skipping preview PNGs (no PDF available)')
+            print(f'[Claude Slides] PDF→PNG failed: {e}')
+
+    if not slide_image_paths:
+        slide_image_paths = _generate_preview_images(course_data, output_dir, theme_id)
+        print(f'[Claude Slides] {len(slide_image_paths)} preview PNGs via Pillow fallback')
 
     # ── Phase 4: Generate voiceover scripts ────────────────────────────────
     slide_texts = _extract_slide_texts(pptx_path)
