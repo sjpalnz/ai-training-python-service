@@ -1163,6 +1163,410 @@ def _slide_deck_job_worker(job_id, document_ids, user_id, options=None, existing
             pass
 
 
+@app.route('/auto-complete-course', methods=['POST'])
+def auto_complete_course():
+    """
+    Start async auto-complete pipeline: slides → quiz → audio → video → (scorm).
+    Expected JSON: { "document_ids": [...], "user_id": "uuid", "target": "mp4"|"scorm",
+                     "credit_cost": int, "options": {...} }
+    Returns: { "job_id": "uuid" } immediately; poll /job-status/<job_id>.
+    """
+    try:
+        data = request.json or {}
+        document_ids = data.get('document_ids', [])
+        user_id = data.get('user_id')
+        target = data.get('target', 'mp4')
+        credit_cost = data.get('credit_cost', 8)
+        options = data.get('options', {})
+
+        if not document_ids:
+            return jsonify({'error': 'document_ids is required'}), 400
+        if not user_id:
+            return jsonify({'error': 'user_id is required'}), 400
+
+        supabase = get_supabase_client()
+        job = supabase.table('generation_jobs').insert({
+            'job_type': 'auto_complete',
+            'status': 'pending',
+            'user_id': user_id,
+        }).execute()
+        job_id = job.data[0]['id']
+
+        threading.Thread(
+            target=_auto_complete_worker,
+            args=(job_id, document_ids, user_id, target, credit_cost, options),
+            daemon=True
+        ).start()
+
+        return jsonify({'success': True, 'job_id': job_id})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def _auto_complete_worker(job_id, document_ids, user_id, target, credit_cost, options):
+    """Background worker: runs full pipeline slides → quiz → audio → video → (scorm)."""
+    try:
+        import shutil
+        import time as _time
+        import requests as http_requests
+        from generate_notebooklm import generate_slide_deck, _extract_slide_texts, _clean_voiceover_script, _parse_voiceover_scripts
+
+        job_start = _time.time()
+        supabase = get_supabase_client()
+        completed_steps = []
+        meta = {'target': target, 'current_step': 'slides', 'steps_completed': [], 'steps_remaining': ['slides', 'quiz', 'audio', 'video'] + (['scorm'] if target == 'scorm' else [])}
+
+        def _update_progress(step, extra_meta=None):
+            meta['current_step'] = step
+            remaining = [s for s in ['slides', 'quiz', 'audio', 'video', 'scorm'] if s not in completed_steps and s != step]
+            if target != 'scorm':
+                remaining = [s for s in remaining if s != 'scorm']
+            meta['steps_completed'] = list(completed_steps)
+            meta['steps_remaining'] = remaining
+            if extra_meta:
+                meta.update(extra_meta)
+            supabase.table('generation_jobs').update({
+                'status': 'processing',
+                'updated_at': datetime.now().isoformat(),
+            }).eq('id', job_id).execute()
+            # Update metadata in a temp generated_files row if exists
+            print(f"[auto-complete] Step: {step} | Completed: {completed_steps}")
+
+        supabase.table('generation_jobs').update({
+            'status': 'processing',
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        # ── Step 1: Generate slides ──
+        _update_progress('slides')
+        docs_result = supabase.table('documents') \
+            .select('id, filename, extracted_text') \
+            .in_('id', document_ids) \
+            .execute()
+        documents = [d for d in (docs_result.data or []) if d.get('extracted_text')]
+        if not documents:
+            raise Exception('No documents with text found')
+
+        title = options.get('title', 'Training Course')
+        job_output_dir = os.path.join(OUTPUT_DIR, f'auto_{job_id}')
+        os.makedirs(job_output_dir, exist_ok=True)
+
+        engine = options.get('slide_engine', 'notebooklm')
+        if engine == 'claude':
+            from generate_claude_slides import generate_slide_deck_claude
+            notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck_claude(
+                documents, title, job_output_dir, options=options
+            )
+        else:
+            try:
+                notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck(
+                    documents, title, job_output_dir, options=options
+                )
+            except Exception:
+                from generate_claude_slides import generate_slide_deck_claude
+                notebook_id, pdf_path, pptx_path, slide_image_paths, voiceover_scripts = generate_slide_deck_claude(
+                    documents, title, job_output_dir, options=options
+                )
+
+        # Upload slides
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        pptx_url = None
+        if pptx_path and os.path.exists(pptx_path):
+            pptx_storage = f"slide_decks/{job_id}_{timestamp}.pptx"
+            with open(pptx_path, 'rb') as f:
+                supabase.storage.from_('course-files').upload(path=pptx_storage, file=f.read(),
+                    file_options={"content-type": "application/vnd.openxmlformats-officedocument.presentationml.presentation"})
+            pptx_url = supabase.storage.from_('course-files').get_public_url(pptx_storage)
+
+        slide_image_urls = []
+        for i, img_path in enumerate(slide_image_paths or []):
+            img_storage = f"slide_decks/{job_id}_slide_{i+1}.png"
+            with open(img_path, 'rb') as f:
+                supabase.storage.from_('course-files').upload(path=img_storage, file=f.read(),
+                    file_options={"content-type": "image/png"})
+            slide_image_urls.append(supabase.storage.from_('course-files').get_public_url(img_storage))
+
+        completed_steps.append('slides')
+
+        # ── Step 2: Generate quiz ──
+        _update_progress('quiz')
+        quiz_data = None
+        try:
+            anthropic_key = os.environ.get('ANTHROPIC_API_KEY')
+            if anthropic_key and voiceover_scripts:
+                slide_content = '\n\n'.join(f'[Slide {i+1}] {s}' for i, s in enumerate(voiceover_scripts) if s)
+                doc_context = '\n\n---\n\n'.join(f'Document: {d["filename"]}\n{d.get("extracted_text", "")[:30000]}' for d in documents[:3])
+                count = options.get('quiz_count', 10)
+                difficulty = options.get('quiz_difficulty', 'medium')
+                pass_pct = options.get('quiz_pass_percent', 70)
+
+                quiz_prompt = f"""Generate exactly {count} multiple-choice quiz questions based on this training content.
+Difficulty: {difficulty}. Each question has 4 options (A-D), one correct answer.
+
+--- SLIDES ---
+{slide_content}
+
+--- SOURCE DOCS ---
+{doc_context[:50000]}
+
+Return ONLY valid JSON:
+{{"questions": [{{"question": "...", "options": ["A...", "B...", "C...", "D..."], "correct": 0, "explanation": "..."}}], "pass_percentage": {pass_pct}}}"""
+
+                resp = http_requests.post('https://api.anthropic.com/v1/messages',
+                    headers={'Content-Type': 'application/json', 'x-api-key': anthropic_key, 'anthropic-version': '2023-06-01'},
+                    json={'model': 'claude-sonnet-4-6', 'max_tokens': 8000, 'messages': [{'role': 'user', 'content': quiz_prompt}]},
+                    timeout=120)
+                if resp.ok:
+                    txt = resp.json()['content'][0]['text']
+                    js = txt[txt.index('{'):txt.rindex('}')+1]
+                    quiz_data = json.loads(js)
+                    print(f"[auto-complete] Quiz: {len(quiz_data.get('questions', []))} questions generated")
+        except Exception as qe:
+            print(f"[auto-complete] Quiz generation failed (non-fatal): {qe}")
+        completed_steps.append('quiz')
+
+        # ── Step 3: Generate audio ──
+        _update_progress('audio')
+        voiceover_zip_url = None
+        if voiceover_scripts and any(s.strip() for s in voiceover_scripts):
+            voice_id = options.get('voice_id', 'aura-athena-en')
+            voice_provider = options.get('voice_provider', 'deepgram')
+
+            from pydub import AudioSegment
+            import zipfile
+            import io
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            audio_dir = os.path.join(job_output_dir, 'audio')
+            os.makedirs(audio_dir, exist_ok=True)
+
+            deepgram_key = os.environ.get('DEEPGRAM_API_KEY')
+            alibaba_key = os.environ.get('ALIBABA_API_KEY')
+
+            def _tts_chunk(text_chunk):
+                if voice_provider == 'deepgram' and deepgram_key:
+                    r = http_requests.post(f'https://api.deepgram.com/v1/speak?model={voice_id}',
+                        headers={'Authorization': f'Token {deepgram_key}', 'Content-Type': 'application/json'},
+                        json={"text": text_chunk}, timeout=120)
+                    r.raise_for_status()
+                    return ('mp3', r.content)
+                else:
+                    r = http_requests.post('https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+                        headers={'Authorization': f'Bearer {alibaba_key}', 'Content-Type': 'application/json'},
+                        json={"model": "qwen3-tts-vc-2026-01-22", "input": {"text": text_chunk, "voice": voice_id}}, timeout=120)
+                    r.raise_for_status()
+                    audio_url = r.json().get('output', {}).get('audio', {}).get('url')
+                    wav = http_requests.get(audio_url, timeout=60)
+                    return ('wav', wav.content)
+
+            mp3_paths = []
+            for si, script in enumerate(voiceover_scripts):
+                script = (script or '').strip()
+                if not script:
+                    silence = AudioSegment.silent(duration=1000)
+                    mp3p = os.path.join(audio_dir, f'slide_{si+1:02d}.mp3')
+                    silence.export(mp3p, format='mp3')
+                    mp3_paths.append(mp3p)
+                    continue
+
+                from generate_notebooklm import chunk_text_for_tts
+                chunks = chunk_text_for_tts(script, max_chars=512)
+                chunk_results = [None] * len(chunks)
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    futs = {executor.submit(_tts_chunk, c): i for i, c in enumerate(chunks)}
+                    for fut in as_completed(futs):
+                        chunk_results[futs[fut]] = fut.result()
+
+                combined = AudioSegment.empty()
+                for fmt, audio_bytes in chunk_results:
+                    seg = AudioSegment.from_mp3(io.BytesIO(audio_bytes)) if fmt == 'mp3' else AudioSegment.from_wav(io.BytesIO(audio_bytes))
+                    combined += seg
+
+                mp3p = os.path.join(audio_dir, f'slide_{si+1:02d}.mp3')
+                combined.export(mp3p, format='mp3', bitrate='128k')
+                mp3_paths.append(mp3p)
+
+            # Zip audio
+            zip_filename = f'voiceover_{job_id[:8]}_{timestamp}.zip'
+            zip_path = os.path.join(job_output_dir, zip_filename)
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for mp3p in mp3_paths:
+                    zf.write(mp3p, os.path.basename(mp3p))
+
+            vo_storage = f'voiceovers/{zip_filename}'
+            with open(zip_path, 'rb') as f:
+                supabase.storage.from_('course-files').upload(path=vo_storage, file=f.read(),
+                    file_options={"content-type": "application/zip"})
+            voiceover_zip_url = supabase.storage.from_('course-files').get_public_url(vo_storage)
+            print(f"[auto-complete] Audio: {len(mp3_paths)} slide MP3s zipped")
+
+        completed_steps.append('audio')
+
+        # ── Step 4: Generate video ──
+        _update_progress('video')
+        video_url = None
+        if voiceover_zip_url and slide_image_urls:
+            # Call existing video endpoint internally
+            video_job = supabase.table('generation_jobs').insert({
+                'job_type': 'voiceover_video', 'status': 'pending', 'user_id': user_id,
+            }).execute()
+            vid_job_id = video_job.data[0]['id']
+
+            _voiceover_video_job_worker(vid_job_id, voiceover_zip_url, slide_image_urls, user_id)
+
+            # Read result
+            vid_result = supabase.table('generation_jobs').select('status, result_file_id').eq('id', vid_job_id).single().execute()
+            if vid_result.data and vid_result.data['status'] == 'completed' and vid_result.data.get('result_file_id'):
+                file_data = supabase.table('generated_files').select('file_url').eq('id', vid_result.data['result_file_id']).single().execute()
+                if file_data.data:
+                    video_url = file_data.data['file_url']
+                    print(f"[auto-complete] Video: {video_url}")
+            else:
+                print(f"[auto-complete] Video generation failed — continuing")
+
+        completed_steps.append('video')
+
+        # ── Step 5: Generate SCORM (if target=scorm) ──
+        scorm_url = None
+        if target == 'scorm' and video_url:
+            _update_progress('scorm')
+            try:
+                from generate_scorm import generate_scorm_package, generate_api_wrapper
+
+                scorm_dir = os.path.join(job_output_dir, 'scorm')
+                os.makedirs(scorm_dir, exist_ok=True)
+
+                course_data = {'title': title, 'slides': []}
+                scorm_zip_path = os.path.join(scorm_dir, 'scorm_package.zip')
+
+                # Build minimal course data for SCORM with video embed
+                import zipfile
+                with zipfile.ZipFile(scorm_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    # imsmanifest.xml
+                    manifest = f'''<?xml version="1.0" encoding="UTF-8"?>
+<manifest identifier="com.trusource.course" version="1.0"
+  xmlns="http://www.imsproject.org/xsd/imscp_rootv1p1p2"
+  xmlns:adlcp="http://www.adlnet.org/xsd/adlcp_rootv1p2">
+  <organizations default="org1">
+    <organization identifier="org1"><title>{title}</title>
+      <item identifier="item1" identifierref="res1"><title>{title}</title></item>
+    </organization>
+  </organizations>
+  <resources>
+    <resource identifier="res1" type="webcontent" adlcp:scormtype="sco" href="index.html">
+      <file href="index.html"/>
+      <file href="APIWrapper.js"/>
+    </resource>
+  </resources>
+</manifest>'''
+                    zf.writestr('imsmanifest.xml', manifest)
+                    zf.writestr('APIWrapper.js', generate_api_wrapper())
+
+                    # Build HTML with video + quiz
+                    quiz_html = ''
+                    if quiz_data and quiz_data.get('questions'):
+                        pass_pct = quiz_data.get('pass_percentage', 70)
+                        quiz_json_str = json.dumps(quiz_data['questions'])
+                        quiz_html = f'''
+<div style="margin-top:30px;padding:20px;background:#f3e5f5;border:2px solid #ce93d8;border-radius:12px;">
+<h2 style="color:#7b1fa2;">Knowledge Check</h2>
+<p style="color:#666;">Answer all questions, then click Submit. Pass mark: {pass_pct}%</p>
+<div id="quiz-container"></div>
+<div id="quiz-result" style="display:none;padding:20px;border-radius:12px;margin-top:20px;text-align:center;"></div>
+<button id="quiz-submit" onclick="submitQuiz()" style="margin-top:15px;background:#7b1fa2;color:white;border:none;padding:12px 32px;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;">Submit Answers</button>
+</div>
+<script>
+(function(){{var questions={quiz_json_str};var passPercent={pass_pct};var c=document.getElementById("quiz-container");
+questions.forEach(function(q,i){{var d=document.createElement("div");d.style.cssText="margin-bottom:20px;padding:16px;background:white;border-radius:10px;border:1px solid #e0e0e0;";
+var h='<p style="font-weight:600;margin-bottom:10px;">'+(i+1)+". "+q.question+"</p>";
+q.options.forEach(function(o,j){{var l=String.fromCharCode(65+j);h+='<label style="display:block;padding:8px 12px;margin:4px 0;border-radius:6px;cursor:pointer;border:1px solid #e0e0e0;"><input type="radio" name="q'+i+'" value="'+j+'" style="margin-right:8px;"> '+l+". "+o+"</label>";}});
+d.innerHTML=h;c.appendChild(d);}});
+window.submitQuiz=function(){{var score=0;var total=questions.length;
+questions.forEach(function(q,i){{var s=document.querySelector('input[name="q'+i+'"]:checked');if(s&&parseInt(s.value)===q.correct)score++;}});
+var pct=Math.round((score/total)*100);var passed=pct>=passPercent;var r=document.getElementById("quiz-result");r.style.display="block";
+r.style.background=passed?"#e8f5e9":"#ffebee";r.style.border="2px solid "+(passed?"#4caf50":"#f44336");
+r.innerHTML='<h2 style="color:'+(passed?"#2e7d32":"#c62828")+';margin:0 0 8px 0;">'+(passed?"PASSED":"NOT PASSED")+"</h2><p style='font-size:24px;font-weight:bold;margin:0;'>"+score+" / "+total+" ("+pct+"%)</p><p style='color:#666;margin:8px 0 0 0;'>Pass mark: "+passPercent+"%</p>";
+document.getElementById("quiz-submit").style.display="none";
+if(window.API){{API.LMSSetValue("cmi.core.score.raw",String(pct));API.LMSSetValue("cmi.core.lesson_status",passed?"passed":"failed");API.LMSCommit("");}}}};
+}})();
+</script>'''
+
+                    index_html = f'''<!DOCTYPE html><html><head><meta charset="utf-8"><title>{title}</title>
+<script src="APIWrapper.js"></script>
+<style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:20px;background:#fafafa;}}
+h1{{color:#1a1a2e;}}video{{width:100%;border-radius:12px;margin:20px 0;}}</style></head>
+<body><h1>{title}</h1>
+<video controls><source src="{video_url}" type="video/mp4">Your browser does not support video.</video>
+{quiz_html}
+<button onclick="if(window.API){{API.LMSSetValue('cmi.core.lesson_status','completed');API.LMSCommit('');alert('Course completed!');}}"
+style="margin-top:20px;background:#0a84ff;color:white;border:none;padding:12px 32px;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;">Complete Course</button>
+<script>if(window.API){{API.LMSInitialize("");API.LMSSetValue("cmi.core.lesson_status","incomplete");}}</script>
+</body></html>'''
+                    zf.writestr('index.html', index_html)
+
+                scorm_storage = f'scorm/{job_id}_{timestamp}.zip'
+                with open(scorm_zip_path, 'rb') as f:
+                    supabase.storage.from_('course-files').upload(path=scorm_storage, file=f.read(),
+                        file_options={"content-type": "application/zip"})
+                scorm_url = supabase.storage.from_('course-files').get_public_url(scorm_storage)
+                print(f"[auto-complete] SCORM: {scorm_url}")
+                completed_steps.append('scorm')
+            except Exception as se:
+                print(f"[auto-complete] SCORM generation failed: {se}")
+
+        # ── Save final result ──
+        elapsed_secs = round(_time.time() - job_start, 1)
+        file_record = supabase.table('generated_files').insert({
+            'file_type': 'auto_complete',
+            'file_url': video_url or pptx_url or '',
+            'file_size': 0,
+            'metadata': json.dumps({
+                'target': target,
+                'slide_images': slide_image_urls,
+                'pptx_url': pptx_url,
+                'voiceover_scripts': voiceover_scripts,
+                'voiceover_zip_url': voiceover_zip_url,
+                'video_url': video_url,
+                'scorm_url': scorm_url,
+                'quiz': quiz_data,
+                'title': title,
+                'slide_engine': engine,
+                'generation_time_secs': elapsed_secs,
+                'steps_completed': completed_steps,
+            })
+        }).execute()
+
+        supabase.table('generation_jobs').update({
+            'status': 'completed',
+            'result_file_id': file_record.data[0]['id'],
+            'updated_at': datetime.now().isoformat()
+        }).eq('id', job_id).execute()
+
+        shutil.rmtree(job_output_dir, ignore_errors=True)
+        print(f"[auto-complete] Pipeline complete: {completed_steps} in {elapsed_secs}s")
+
+    except Exception as err:
+        import traceback
+        print(f"[auto-complete] Job {job_id} failed: {err}")
+        print(f"[auto-complete] Traceback:\n{traceback.format_exc()}")
+        try:
+            supabase = get_supabase_client()
+            supabase.table('generation_jobs').update({
+                'status': 'failed',
+                'error_message': str(err)[:500],
+                'updated_at': datetime.now().isoformat()
+            }).eq('id', job_id).execute()
+            # Refund credits for uncompleted steps
+            step_costs = {'slides': 3, 'quiz': 2, 'audio': 3, 'video': 5 if target == 'scorm' else 5, 'scorm': 2}
+            refund = sum(v for k, v in step_costs.items() if k not in completed_steps and (k != 'scorm' or target == 'scorm'))
+            if refund > 0:
+                supabase.rpc('refund_credits', {'p_user_id': user_id, 'p_amount': refund, 'p_operation': 'auto_complete_refund', 'p_reference_id': None}).execute()
+                print(f"[auto-complete] Refunded {refund} credits for failed steps")
+        except Exception:
+            pass
+
+
 @app.route('/generate-slides-content', methods=['POST'])
 def generate_slides_content():
     """
