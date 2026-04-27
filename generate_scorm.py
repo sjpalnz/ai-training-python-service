@@ -5,7 +5,7 @@ import requests
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
-def generate_scorm_package(course_data, output_path, podcast_url=None, infographic_url=None):
+def generate_scorm_package(course_data, output_path, podcast_url=None, infographic_url=None, quiz_data=None):
     """
     Generate SCORM 1.2 package from course outline
 
@@ -14,6 +14,7 @@ def generate_scorm_package(course_data, output_path, podcast_url=None, infograph
         output_path:      Path where .zip file will be saved
         podcast_url:      Optional public URL to an MP3 podcast to embed as audio player
         infographic_url:  Optional public URL to a PNG infographic to embed as image
+        quiz_data:        Optional dict with 'questions' array and 'pass_percentage'
     """
     # Create temp directory for SCORM files
     temp_dir = '/tmp/scorm_temp'
@@ -226,9 +227,67 @@ def generate_html(course_data, podcast_url=None, infographic_url=None):
         </div>
 '''
 
+    # Interactive quiz section
+    if quiz_data and quiz_data.get('questions'):
+        import json as _json
+        pass_pct = quiz_data.get('pass_percentage', 70)
+        quiz_json = _json.dumps(quiz_data['questions'])
+        html += f'''
+        <div class="slide" style="background: #f3e5f5; border: 2px solid #ce93d8;">
+            <div class="slide-title" style="color: #7b1fa2;">Knowledge Check</div>
+            <p style="color: #666; margin-bottom: 20px;">Answer all questions below, then click Submit to see your score. Pass mark: {pass_pct}%</p>
+            <div id="quiz-container"></div>
+            <div id="quiz-result" style="display:none; padding: 20px; border-radius: 12px; margin-top: 20px; text-align: center;"></div>
+            <button id="quiz-submit" onclick="submitQuiz()" style="margin-top: 15px; background: #7b1fa2; color: white; border: none; padding: 12px 32px; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer;">Submit Answers</button>
+        </div>
+        <script>
+        (function() {{
+            var questions = {quiz_json};
+            var passPercent = {pass_pct};
+            var container = document.getElementById('quiz-container');
+            questions.forEach(function(q, i) {{
+                var div = document.createElement('div');
+                div.style.cssText = 'margin-bottom: 20px; padding: 16px; background: white; border-radius: 10px; border: 1px solid #e0e0e0;';
+                var html = '<p style="font-weight: 600; margin-bottom: 10px;">' + (i+1) + '. ' + q.question + '</p>';
+                q.options.forEach(function(opt, j) {{
+                    var letter = String.fromCharCode(65 + j);
+                    html += '<label style="display: block; padding: 8px 12px; margin: 4px 0; border-radius: 6px; cursor: pointer; border: 1px solid #e0e0e0;">';
+                    html += '<input type="radio" name="q' + i + '" value="' + j + '" style="margin-right: 8px;"> ' + letter + '. ' + opt;
+                    html += '</label>';
+                }});
+                div.innerHTML = html;
+                container.appendChild(div);
+            }});
+            window.submitQuiz = function() {{
+                var score = 0;
+                var total = questions.length;
+                questions.forEach(function(q, i) {{
+                    var selected = document.querySelector('input[name="q' + i + '"]:checked');
+                    if (selected && parseInt(selected.value) === q.correct) score++;
+                }});
+                var pct = Math.round((score / total) * 100);
+                var passed = pct >= passPercent;
+                var result = document.getElementById('quiz-result');
+                result.style.display = 'block';
+                result.style.background = passed ? '#e8f5e9' : '#ffebee';
+                result.style.border = '2px solid ' + (passed ? '#4caf50' : '#f44336');
+                result.innerHTML = '<h2 style="color: ' + (passed ? '#2e7d32' : '#c62828') + '; margin: 0 0 8px 0;">' + (passed ? 'PASSED' : 'NOT PASSED') + '</h2>'
+                    + '<p style="font-size: 24px; font-weight: bold; margin: 0;">' + score + ' / ' + total + ' (' + pct + '%)</p>'
+                    + '<p style="color: #666; margin: 8px 0 0 0;">Pass mark: ' + passPercent + '%</p>';
+                document.getElementById('quiz-submit').style.display = 'none';
+                if (window.API) {{
+                    API.LMSSetValue("cmi.core.score.raw", String(pct));
+                    API.LMSSetValue("cmi.core.lesson_status", passed ? "passed" : "failed");
+                    API.LMSCommit("");
+                }}
+            }};
+        }})();
+        </script>
+'''
+
     html += '''        <button onclick="completeCourse()">Complete Course</button>
     </div>
-    
+
     <script>
         function completeCourse() {
             if (window.API) {
@@ -238,7 +297,7 @@ def generate_html(course_data, podcast_url=None, infographic_url=None):
                 alert("Course completed successfully!");
             }
         }
-        
+
         // Initialize SCORM
         if (window.API) {
             API.LMSInitialize("");

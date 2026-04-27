@@ -249,6 +249,45 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                     size = body_size, color  = text_color,
                 )
 
+        elif slide_type == 'quiz_divider':
+            _add_title_box(
+                slide,
+                text   = slide_data.get('title', 'Knowledge Check'),
+                left   = Inches(0.5), top    = Inches(2.5),
+                width  = Inches(9),   height = Inches(2),
+                size   = title_size,  bold   = True,
+                color  = heading_color, align = PP_ALIGN.CENTER,
+            )
+
+        elif slide_type == 'quiz_answer':
+            _add_title_box(
+                slide,
+                text   = slide_data.get('title', 'Answer'),
+                left   = Inches(0.5), top    = Inches(0.4),
+                width  = Inches(9),   height = Inches(0.8),
+                size   = Pt(28),      bold   = True,
+                color  = heading_color,
+            )
+            answer_text = slide_data.get('answer', '')
+            if answer_text:
+                _add_title_box(
+                    slide,
+                    text   = f'Correct: {answer_text}',
+                    left   = Inches(0.5), top    = Inches(1.5),
+                    width  = Inches(9),   height = Inches(0.8),
+                    size   = Pt(22),      bold   = True,
+                    color  = accent_color,
+                )
+            if slide_data.get('explanation'):
+                _add_title_box(
+                    slide,
+                    text   = slide_data['explanation'],
+                    left   = Inches(0.5), top    = Inches(2.8),
+                    width  = Inches(9),   height = Inches(4),
+                    size   = body_size,   bold   = False,
+                    color  = text_color,
+                )
+
         elif slide_type == 'activity':
             # Activity slide — title, delivery-mode label, duration, instructions
             activity_type = slide_data.get('activity_type', '')
