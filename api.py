@@ -1837,17 +1837,51 @@ def list_voices():
 
 @app.route('/preview-voice', methods=['GET', 'POST'])
 def preview_voice():
-    """Generate a short TTS preview for a Deepgram stock voice. Returns MP3 audio."""
+    """Generate a short TTS preview. Supports Deepgram (stock) and Qwen (cloned) voices."""
     try:
         import requests as http_requests
         if request.method == 'GET':
             voice_id = request.args.get('voice_id', 'aura-asteria-en')
+            provider = request.args.get('provider', 'deepgram')
             text = 'Welcome to your training course. This is a preview of the selected voice.'
         else:
             data = request.json or {}
             voice_id = data.get('voice_id', 'aura-asteria-en')
+            provider = data.get('provider', 'deepgram')
             text = data.get('text', 'Welcome to your training course.')
 
+        from flask import Response as FlaskResponse
+
+        if provider == 'qwen':
+            alibaba_key = os.environ.get('ALIBABA_API_KEY')
+            if not alibaba_key:
+                return jsonify({'error': 'ALIBABA_API_KEY not configured'}), 500
+
+            resp = http_requests.post(
+                'https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+                headers={'Authorization': f'Bearer {alibaba_key}', 'Content-Type': 'application/json'},
+                json={"model": "qwen3-tts-vc-2026-01-22", "input": {"text": text, "voice": voice_id}},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            audio_url = result.get('output', {}).get('audio', {}).get('url')
+            if not audio_url:
+                return jsonify({'error': 'No audio URL returned'}), 500
+            wav_resp = http_requests.get(audio_url, timeout=30)
+            wav_resp.raise_for_status()
+            # Convert WAV to MP3 for browser playback
+            from pydub import AudioSegment
+            import io
+            audio = AudioSegment.from_wav(io.BytesIO(wav_resp.content))
+            mp3_buf = io.BytesIO()
+            audio.export(mp3_buf, format='mp3', bitrate='128k')
+            return FlaskResponse(mp3_buf.getvalue(), mimetype='audio/mpeg', headers={
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'public, max-age=3600',
+            })
+
+        # Default: Deepgram
         deepgram_key = os.environ.get('DEEPGRAM_API_KEY')
         if not deepgram_key:
             return jsonify({'error': 'DEEPGRAM_API_KEY not configured'}), 500
@@ -1863,7 +1897,6 @@ def preview_voice():
         )
         resp.raise_for_status()
 
-        from flask import Response as FlaskResponse
         return FlaskResponse(resp.content, mimetype='audio/mpeg', headers={
             'Access-Control-Allow-Origin': '*',
             'Cache-Control': 'public, max-age=3600',
