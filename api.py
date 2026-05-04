@@ -724,7 +724,7 @@ def process_documents():
                 'drive_file_id': drive_file_id,
                 'extracted_text': extracted_text,
                 'file_size': file_size
-            }).select('id').execute()
+            }).execute()
 
             # ── RAG: chunk + embed the document ──────────────────────────────
             try:
