@@ -498,7 +498,8 @@ def check_drive_updates():
                     updated.append({
                         'doc_id': doc['id'],
                         'drive_file_id': doc['drive_file_id'],
-                        'current_modified_time': current_modified
+                        'current_modified_time': current_modified,
+                        'imported_modified_time': stored_modified
                     })
             except Exception:
                 pass  # File may have been deleted from Drive
