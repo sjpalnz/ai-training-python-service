@@ -494,7 +494,16 @@ def check_drive_updates():
                 ).execute()
                 current_modified = meta.get('modifiedTime', '')
                 stored_modified = doc.get('drive_modified_time', '')
-                if current_modified and stored_modified and current_modified > stored_modified:
+                # Parse both as datetimes to avoid format mismatch false positives
+                if current_modified and stored_modified:
+                    from dateutil import parser as dtparser
+                    current_dt = dtparser.isoparse(current_modified)
+                    stored_dt = dtparser.isoparse(stored_modified)
+                    # Only flag if Drive version is actually newer (> 60s difference to avoid rounding)
+                    is_updated = (current_dt - stored_dt).total_seconds() > 60
+                else:
+                    is_updated = False
+                if is_updated:
                     updated.append({
                         'doc_id': doc['id'],
                         'drive_file_id': doc['drive_file_id'],
