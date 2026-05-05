@@ -1380,7 +1380,7 @@ Return ONLY valid JSON:
                     mp3_paths.append(mp3p)
                     continue
 
-                from generate_notebooklm import chunk_text_for_tts
+                # chunk_text_for_tts is defined in this file (api.py)
                 chunks = chunk_text_for_tts(script, max_chars=512)
                 chunk_results = [None] * len(chunks)
                 with ThreadPoolExecutor(max_workers=3) as executor:
