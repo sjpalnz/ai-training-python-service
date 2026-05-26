@@ -93,15 +93,57 @@ def get_supabase_client():
         raise Exception('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables required')
     return create_client(supabase_url, supabase_key)
 
-def _derive_title(meta_title, extracted_text):
-    """Embedded metadata title if present, else the first usable line of text."""
-    if meta_title and meta_title.strip():
-        return meta_title.strip()[:200]
+def _first_text_line(extracted_text):
+    """First usable line of text (>= 3 chars). Last-resort title fallback."""
     for line in (extracted_text or '').splitlines():
         s = line.strip()
         if len(s) >= 3:
             return s[:200]
-    return None  # let the app fall back to filename
+    return None
+
+
+def _ai_title(extracted_text):
+    """Ask Claude for a clean human title from the start of a document. None on failure."""
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key or not extracted_text or not extracted_text.strip():
+        return None
+    snippet = extracted_text.strip()[:3000]
+    try:
+        import requests as http_requests
+        resp = http_requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={'Content-Type': 'application/json', 'x-api-key': api_key, 'anthropic-version': '2023-06-01'},
+            json={
+                'model': 'claude-sonnet-4-6',
+                'max_tokens': 40,
+                'messages': [{
+                    'role': 'user',
+                    'content': (
+                        "Below is the beginning of a document. Reply with ONLY the document's "
+                        "human-readable title — no quotes, no explanation, and ignore reference "
+                        "codes or document numbers (e.g. '2000-HS-PRO-0001'). If there is no clear "
+                        "title, reply with exactly: NONE\n\n" + snippet
+                    )
+                }]
+            },
+            timeout=30
+        )
+        if resp.status_code != 200:
+            return None
+        text = resp.json()['content'][0]['text'].strip()
+        if not text or text.upper() == 'NONE':
+            return None
+        return text[:200]
+    except Exception as e:
+        print(f"[_ai_title] error: {e}")
+        return None
+
+
+def _derive_title(meta_title, extracted_text):
+    """Embedded metadata title, else an AI-generated title from page 1, else first text line."""
+    if meta_title and meta_title.strip():
+        return meta_title.strip()[:200]
+    return _ai_title(extracted_text) or _first_text_line(extracted_text)
 
 
 @app.route('/health', methods=['GET'])
@@ -2640,6 +2682,47 @@ def reindex_documents():
 
     except Exception as e:
         print(f"[reindex-documents] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+def _regenerate_titles_worker(client_id):
+    try:
+        supabase = get_supabase_client()
+        q = supabase.table('documents').select('id, extracted_text')
+        if client_id:
+            q = q.eq('client_id', client_id)
+        docs = q.execute().data or []
+        updated = 0
+        for d in docs:
+            text = d.get('extracted_text')
+            title = _ai_title(text) or _first_text_line(text)
+            if title:
+                supabase.table('documents').update({'title': title}).eq('id', d['id']).execute()
+                updated += 1
+        print(f"[regenerate-titles] updated {updated}/{len(docs)} documents")
+    except Exception as e:
+        print(f"[regenerate-titles] error: {e}")
+
+
+@app.route('/regenerate-titles', methods=['POST'])
+def regenerate_titles():
+    """
+    Regenerate AI titles for existing documents (page-1 → Claude title), updating documents.title.
+    Runs in a background thread and returns immediately — check Railway logs for progress.
+
+    Expected JSON: { "client_id": str (UUID, optional) }  — omit to process all documents.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        client_id = (data.get('client_id') or '').strip() or None
+        threading.Thread(target=_regenerate_titles_worker, args=(client_id,), daemon=True).start()
+        return jsonify({
+            'success': True,
+            'message': 'Title regeneration started in background. Check Railway logs for progress.',
+            'client_id': client_id,
+        })
+    except Exception as e:
+        print(f"[regenerate-titles] Error: {e}")
         return jsonify({'error': str(e)}), 500
 
 
