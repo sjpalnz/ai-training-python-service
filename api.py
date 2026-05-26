@@ -2685,47 +2685,6 @@ def reindex_documents():
         return jsonify({'error': str(e)}), 500
 
 
-def _regenerate_titles_worker(client_id):
-    try:
-        supabase = get_supabase_client()
-        q = supabase.table('documents').select('id, extracted_text')
-        if client_id:
-            q = q.eq('client_id', client_id)
-        docs = q.execute().data or []
-        updated = 0
-        for d in docs:
-            text = d.get('extracted_text')
-            title = _ai_title(text) or _first_text_line(text)
-            if title:
-                supabase.table('documents').update({'title': title}).eq('id', d['id']).execute()
-                updated += 1
-        print(f"[regenerate-titles] updated {updated}/{len(docs)} documents")
-    except Exception as e:
-        print(f"[regenerate-titles] error: {e}")
-
-
-@app.route('/regenerate-titles', methods=['POST'])
-def regenerate_titles():
-    """
-    Regenerate AI titles for existing documents (page-1 → Claude title), updating documents.title.
-    Runs in a background thread and returns immediately — check Railway logs for progress.
-
-    Expected JSON: { "client_id": str (UUID, optional) }  — omit to process all documents.
-    """
-    try:
-        data = request.get_json(silent=True) or {}
-        client_id = (data.get('client_id') or '').strip() or None
-        threading.Thread(target=_regenerate_titles_worker, args=(client_id,), daemon=True).start()
-        return jsonify({
-            'success': True,
-            'message': 'Title regeneration started in background. Check Railway logs for progress.',
-            'client_id': client_id,
-        })
-    except Exception as e:
-        print(f"[regenerate-titles] Error: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
 ###############################################################################
 # SCORM Cloud LMS Push
 ###############################################################################
