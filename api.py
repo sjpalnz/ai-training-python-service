@@ -93,6 +93,17 @@ def get_supabase_client():
         raise Exception('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables required')
     return create_client(supabase_url, supabase_key)
 
+def _derive_title(meta_title, extracted_text):
+    """Embedded metadata title if present, else the first usable line of text."""
+    if meta_title and meta_title.strip():
+        return meta_title.strip()[:200]
+    for line in (extracted_text or '').splitlines():
+        s = line.strip()
+        if len(s) >= 3:
+            return s[:200]
+    return None  # let the app fall back to filename
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -592,10 +603,12 @@ def process_documents():
                 f.write(file_content)
 
             extracted_text = ''
+            meta_title = None
             try:
                 if file_ext == 'pdf':
                     from pypdf import PdfReader
                     reader = PdfReader(temp_path)
+                    meta_title = reader.metadata.title if reader.metadata else None
                     for page in reader.pages:
                         page_text = page.extract_text()
                         if page_text:
@@ -603,6 +616,7 @@ def process_documents():
                 elif file_ext in ['docx', 'doc']:
                     from docx import Document
                     doc = Document(temp_path)
+                    meta_title = doc.core_properties.title
                     for para in doc.paragraphs:
                         if para.text.strip():
                             extracted_text += para.text + '\n'
@@ -627,6 +641,7 @@ def process_documents():
                 'drive_file_id': google_drive_file_id,
                 'source': 'google_drive',
                 'extracted_text': extracted_text,
+                'title': _derive_title(meta_title, extracted_text),
                 'file_size': file_size or len(file_content),
                 'drive_modified_time': drive_modified_time
             }).execute()
@@ -690,10 +705,12 @@ def process_documents():
 
             # Extract text based on file type
             extracted_text = ''
+            meta_title = None
             try:
                 if file_ext == 'pdf':
                     from pypdf import PdfReader
                     reader = PdfReader(temp_path)
+                    meta_title = reader.metadata.title if reader.metadata else None
                     for page in reader.pages:
                         page_text = page.extract_text()
                         if page_text:
@@ -702,6 +719,7 @@ def process_documents():
                 elif file_ext in ['docx', 'doc']:
                     from docx import Document
                     doc = Document(temp_path)
+                    meta_title = doc.core_properties.title
                     for para in doc.paragraphs:
                         if para.text.strip():
                             extracted_text += para.text + '\n'
@@ -733,6 +751,7 @@ def process_documents():
                 'file_type': file_ext,
                 'drive_file_id': drive_file_id,
                 'extracted_text': extracted_text,
+                'title': _derive_title(meta_title, extracted_text),
                 'file_size': file_size
             }).execute()
 
