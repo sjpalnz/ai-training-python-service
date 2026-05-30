@@ -1906,6 +1906,144 @@ def list_voices():
         return jsonify({'error': str(e)}), 500
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Streaming TTS for the mobile Ask screen.
+# Flow: client POSTs the answer text to /tts-start, gets back an opaque
+# session_id, then plays AudioSource.uri('/tts-stream/<sid>'). The stream
+# endpoint splits the text into ~sentence-sized chunks and writes each
+# chunk's MP3 to the response as soon as it's synthesised, so the player
+# starts speaking after just the first sentence renders instead of waiting
+# for the whole answer.
+# ──────────────────────────────────────────────────────────────────────────────
+import uuid as _uuid
+import time as _time
+from threading import Lock as _Lock
+
+_TTS_SESSIONS = {}
+_TTS_SESSIONS_LOCK = _Lock()
+_TTS_SESSION_TTL_SECONDS = 300  # 5 minutes
+
+
+def _tts_session_create(text, voice_id, provider):
+    sid = str(_uuid.uuid4())
+    now = _time.time()
+    with _TTS_SESSIONS_LOCK:
+        # Lazy cleanup of any expired sessions.
+        expired = [k for k, v in _TTS_SESSIONS.items() if now - v['created_at'] > _TTS_SESSION_TTL_SECONDS]
+        for k in expired:
+            _TTS_SESSIONS.pop(k, None)
+        _TTS_SESSIONS[sid] = {'text': text, 'voice_id': voice_id, 'provider': provider, 'created_at': now}
+    return sid
+
+
+def _tts_session_consume(sid):
+    with _TTS_SESSIONS_LOCK:
+        return _TTS_SESSIONS.pop(sid, None)
+
+
+def _chunk_for_tts(text, target=180, max_chars=400):
+    """Split text into ~sentence-sized chunks. First chunk small so audio starts fast."""
+    import re
+    sents = [s for s in re.split(r'(?<=[.!?…])\s+', (text or '').strip()) if s]
+    chunks, buf = [], ''
+    for s in sents:
+        if not buf:
+            buf = s
+        elif len(buf) + 1 + len(s) <= max_chars:
+            buf = f"{buf} {s}"
+        else:
+            chunks.append(buf); buf = s
+        if len(buf) >= target:
+            chunks.append(buf); buf = ''
+    if buf:
+        chunks.append(buf)
+    return chunks or ([text] if text else [])
+
+
+def _tts_mp3_bytes(text, voice_id, provider):
+    """Synthesize one chunk of text and return MP3 bytes. Raises on failure."""
+    import requests as http_requests
+    if provider == 'qwen':
+        alibaba_key = os.environ.get('ALIBABA_API_KEY')
+        if not alibaba_key:
+            raise RuntimeError('ALIBABA_API_KEY not configured')
+        resp = http_requests.post(
+            'https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+            headers={'Authorization': f'Bearer {alibaba_key}', 'Content-Type': 'application/json'},
+            json={"model": "qwen3-tts-vc-2026-01-22", "input": {"text": text, "voice": voice_id}},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        audio_url = resp.json().get('output', {}).get('audio', {}).get('url')
+        if not audio_url:
+            raise RuntimeError('Qwen: no audio URL returned')
+        wav_resp = http_requests.get(audio_url, timeout=30)
+        wav_resp.raise_for_status()
+        from pydub import AudioSegment
+        import io
+        audio = AudioSegment.from_wav(io.BytesIO(wav_resp.content))
+        mp3_buf = io.BytesIO()
+        audio.export(mp3_buf, format='mp3', bitrate='128k')
+        return mp3_buf.getvalue()
+    # Default: Deepgram
+    deepgram_key = os.environ.get('DEEPGRAM_API_KEY')
+    if not deepgram_key:
+        raise RuntimeError('DEEPGRAM_API_KEY not configured')
+    resp = http_requests.post(
+        f'https://api.deepgram.com/v1/speak?model={voice_id}',
+        headers={'Authorization': f'Token {deepgram_key}', 'Content-Type': 'application/json'},
+        json={"text": text},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+@app.route('/tts-start', methods=['POST'])
+def tts_start():
+    """Create a streaming TTS session. Returns { session_id }."""
+    try:
+        data = request.json or {}
+        text = (data.get('text') or '').strip()
+        voice_id = data.get('voice_id') or 'aura-asteria-en'
+        provider = data.get('provider') or 'deepgram'
+        if not text:
+            return jsonify({'error': 'text is required'}), 400
+        # Cap to bound memory / synthesis cost per session.
+        if len(text) > 5000:
+            text = text[:5000]
+        sid = _tts_session_create(text, voice_id, provider)
+        return jsonify({'session_id': sid})
+    except Exception as e:
+        print(f"[tts-start] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/tts-stream/<session_id>', methods=['GET'])
+def tts_stream(session_id):
+    """Stream MP3 audio for a session, sentence-by-sentence, as each chunk renders."""
+    from flask import Response as FlaskResponse
+    sess = _tts_session_consume(session_id)
+    if not sess:
+        return jsonify({'error': 'session not found or expired'}), 404
+    text, voice_id, provider = sess['text'], sess['voice_id'], sess['provider']
+    chunks = _chunk_for_tts(text)
+
+    def generate():
+        for ch in chunks:
+            try:
+                yield _tts_mp3_bytes(ch, voice_id, provider)
+            except Exception as e:
+                # Stop streaming on chunk failure; the player will end gracefully.
+                print(f"[tts-stream] chunk error: {e}")
+                break
+
+    return FlaskResponse(generate(), mimetype='audio/mpeg', headers={
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',  # disable any proxy buffering
+    })
+
+
 @app.route('/preview-voice', methods=['GET', 'POST'])
 def preview_voice():
     """Generate a short TTS preview. Supports Deepgram (stock) and Qwen (cloned) voices."""
