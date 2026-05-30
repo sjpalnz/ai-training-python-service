@@ -1960,6 +1960,42 @@ def _chunk_for_tts(text, target=180, max_chars=400):
     return chunks or ([text] if text else [])
 
 
+from functools import lru_cache as _lru_cache
+
+
+@_lru_cache(maxsize=50)
+def _tts_mp3_bytes_cached(text, voice_id, provider):
+    """LRU-cached MP3 synthesis. Replays of the same (text, voice, provider) are instant."""
+    return _tts_mp3_bytes(text, voice_id, provider)
+
+
+@_lru_cache(maxsize=50)
+def _qwen_wav_bytes_cached(text, voice_id):
+    """Single-shot Qwen path: fetch the WAV directly without pydub conversion.
+
+    just_audio plays WAV natively. Used only by /preview-voice (single-shot); the
+    streaming /tts-stream path keeps MP3 because multiple WAV chunks can't be
+    concatenated cleanly (each carries its own RIFF header).
+    """
+    import requests as http_requests
+    alibaba_key = os.environ.get('ALIBABA_API_KEY')
+    if not alibaba_key:
+        raise RuntimeError('ALIBABA_API_KEY not configured')
+    resp = http_requests.post(
+        'https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+        headers={'Authorization': f'Bearer {alibaba_key}', 'Content-Type': 'application/json'},
+        json={"model": "qwen3-tts-vc-2026-01-22", "input": {"text": text, "voice": voice_id}},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    audio_url = resp.json().get('output', {}).get('audio', {}).get('url')
+    if not audio_url:
+        raise RuntimeError('Qwen: no audio URL returned')
+    wav_resp = http_requests.get(audio_url, timeout=30)
+    wav_resp.raise_for_status()
+    return wav_resp.content
+
+
 def _tts_mp3_bytes(text, voice_id, provider):
     """Synthesize one chunk of text and return MP3 bytes. Raises on failure."""
     import requests as http_requests
@@ -2032,7 +2068,7 @@ def tts_stream(session_id):
     def generate():
         for ch in chunks:
             try:
-                yield _tts_mp3_bytes(ch, voice_id, provider)
+                yield _tts_mp3_bytes_cached(ch, voice_id, provider)
             except Exception as e:
                 # Stop streaming on chunk failure; the player will end gracefully.
                 print(f"[tts-stream] chunk error: {e}")
@@ -2061,52 +2097,23 @@ def preview_voice():
 
         from flask import Response as FlaskResponse
 
+        # Qwen single-shot: stream WAV directly (skip pydub for ~300–500 ms saved).
         if provider == 'qwen':
-            alibaba_key = os.environ.get('ALIBABA_API_KEY')
-            if not alibaba_key:
-                return jsonify({'error': 'ALIBABA_API_KEY not configured'}), 500
-
-            resp = http_requests.post(
-                'https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
-                headers={'Authorization': f'Bearer {alibaba_key}', 'Content-Type': 'application/json'},
-                json={"model": "qwen3-tts-vc-2026-01-22", "input": {"text": text, "voice": voice_id}},
-                timeout=60,
-            )
-            resp.raise_for_status()
-            result = resp.json()
-            audio_url = result.get('output', {}).get('audio', {}).get('url')
-            if not audio_url:
-                return jsonify({'error': 'No audio URL returned'}), 500
-            wav_resp = http_requests.get(audio_url, timeout=30)
-            wav_resp.raise_for_status()
-            # Convert WAV to MP3 for browser playback
-            from pydub import AudioSegment
-            import io
-            audio = AudioSegment.from_wav(io.BytesIO(wav_resp.content))
-            mp3_buf = io.BytesIO()
-            audio.export(mp3_buf, format='mp3', bitrate='128k')
-            return FlaskResponse(mp3_buf.getvalue(), mimetype='audio/mpeg', headers={
+            try:
+                wav = _qwen_wav_bytes_cached(text, voice_id)
+            except RuntimeError as e:
+                return jsonify({'error': str(e)}), 500
+            return FlaskResponse(wav, mimetype='audio/wav', headers={
                 'Access-Control-Allow-Origin': '*',
                 'Cache-Control': 'public, max-age=3600',
             })
 
-        # Default: Deepgram
-        deepgram_key = os.environ.get('DEEPGRAM_API_KEY')
-        if not deepgram_key:
-            return jsonify({'error': 'DEEPGRAM_API_KEY not configured'}), 500
-
-        resp = http_requests.post(
-            f'https://api.deepgram.com/v1/speak?model={voice_id}',
-            headers={
-                'Authorization': f'Token {deepgram_key}',
-                'Content-Type': 'application/json',
-            },
-            json={"text": text},
-            timeout=30,
-        )
-        resp.raise_for_status()
-
-        return FlaskResponse(resp.content, mimetype='audio/mpeg', headers={
+        # Default: Deepgram — go through the cache so replays are instant.
+        try:
+            mp3 = _tts_mp3_bytes_cached(text, voice_id, 'deepgram')
+        except RuntimeError as e:
+            return jsonify({'error': str(e)}), 500
+        return FlaskResponse(mp3, mimetype='audio/mpeg', headers={
             'Access-Control-Allow-Origin': '*',
             'Cache-Control': 'public, max-age=3600',
         })
