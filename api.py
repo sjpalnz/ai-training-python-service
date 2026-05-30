@@ -1924,7 +1924,7 @@ _TTS_SESSIONS_LOCK = _Lock()
 _TTS_SESSION_TTL_SECONDS = 300  # 5 minutes
 
 
-def _tts_session_create(text, voice_id, provider):
+def _tts_session_create(chunks, voice_id, provider):
     sid = str(_uuid.uuid4())
     now = _time.time()
     with _TTS_SESSIONS_LOCK:
@@ -1932,13 +1932,14 @@ def _tts_session_create(text, voice_id, provider):
         expired = [k for k, v in _TTS_SESSIONS.items() if now - v['created_at'] > _TTS_SESSION_TTL_SECONDS]
         for k in expired:
             _TTS_SESSIONS.pop(k, None)
-        _TTS_SESSIONS[sid] = {'text': text, 'voice_id': voice_id, 'provider': provider, 'created_at': now}
+        _TTS_SESSIONS[sid] = {'chunks': chunks, 'voice_id': voice_id, 'provider': provider, 'created_at': now}
     return sid
 
 
-def _tts_session_consume(sid):
+def _tts_session_get(sid):
+    """Non-consuming session lookup (each chunk URL hits the same session)."""
     with _TTS_SESSIONS_LOCK:
-        return _TTS_SESSIONS.pop(sid, None)
+        return _TTS_SESSIONS.get(sid)
 
 
 def _chunk_for_tts(text, target=180, max_chars=400):
@@ -2037,7 +2038,8 @@ def _tts_mp3_bytes(text, voice_id, provider):
 
 @app.route('/tts-start', methods=['POST'])
 def tts_start():
-    """Create a streaming TTS session. Returns { session_id }."""
+    """Pre-chunk a TTS session. Returns { session_id, chunks: int } so the mobile
+    can build a ConcatenatingAudioSource and play each chunk's MP3 gaplessly."""
     try:
         data = request.json or {}
         text = (data.get('text') or '').strip()
@@ -2048,35 +2050,34 @@ def tts_start():
         # Cap to bound memory / synthesis cost per session.
         if len(text) > 5000:
             text = text[:5000]
-        sid = _tts_session_create(text, voice_id, provider)
-        return jsonify({'session_id': sid})
+        chunks = _chunk_for_tts(text)
+        if not chunks:
+            return jsonify({'error': 'no synthesizable text'}), 400
+        sid = _tts_session_create(chunks, voice_id, provider)
+        return jsonify({'session_id': sid, 'chunks': len(chunks)})
     except Exception as e:
         print(f"[tts-start] Error: {e}")
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/tts-stream/<session_id>', methods=['GET'])
-def tts_stream(session_id):
-    """Stream MP3 audio for a session, sentence-by-sentence, as each chunk renders."""
+@app.route('/tts-chunk/<session_id>/<int:chunk_index>', methods=['GET'])
+def tts_chunk(session_id, chunk_index):
+    """Return one chunk's MP3 as a complete independent file. Cached, so replays
+    and intra-session re-requests are instant."""
     from flask import Response as FlaskResponse
-    sess = _tts_session_consume(session_id)
+    sess = _tts_session_get(session_id)
     if not sess:
         return jsonify({'error': 'session not found or expired'}), 404
-    text, voice_id, provider = sess['text'], sess['voice_id'], sess['provider']
-    chunks = _chunk_for_tts(text)
-
-    def generate():
-        for ch in chunks:
-            try:
-                yield _tts_mp3_bytes_cached(ch, voice_id, provider)
-            except Exception as e:
-                # Stop streaming on chunk failure; the player will end gracefully.
-                print(f"[tts-stream] chunk error: {e}")
-                break
-
-    return FlaskResponse(generate(), mimetype='audio/mpeg', headers={
-        'Cache-Control': 'no-cache',
-        'X-Accel-Buffering': 'no',  # disable any proxy buffering
+    chunks = sess['chunks']
+    if chunk_index < 0 or chunk_index >= len(chunks):
+        return jsonify({'error': 'chunk index out of range'}), 404
+    try:
+        mp3 = _tts_mp3_bytes_cached(chunks[chunk_index], sess['voice_id'], sess['provider'])
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 500
+    return FlaskResponse(mp3, mimetype='audio/mpeg', headers={
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=300',
     })
 
 
