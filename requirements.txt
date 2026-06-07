@@ -12,6 +12,7 @@ google-auth-httplib2==0.2.0
 google-api-python-client==2.100.0
 notebooklm-py
 pdf2image==1.17.0
+pillow>=10.0.0
 pydub>=0.25.1
 audioop-lts>=0.2.1
 requests>=2.31.0

@@ -38,6 +38,38 @@ OUTPUT_DIR = '/tmp/generated_files'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+def _extract_pdf_smart(temp_path):
+    """
+    Extract text from a PDF. Uses pypdf for ordinary documents, but falls back to
+    Claude vision transcription for matrix/spreadsheet or scanned PDFs whose layout
+    pypdf flattens (which breaks row<->column relationships in the RAG index).
+    Returns (text, meta_title).
+    """
+    from pypdf import PdfReader
+    reader = PdfReader(temp_path)
+    meta_title = reader.metadata.title if reader.metadata else None
+    text = ''
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + '\n'
+
+    try:
+        from pdf_vision import should_use_vision, extract_pdf_markdown
+        use, reason = should_use_vision(temp_path, text)
+        if use:
+            print(f"[pdf-vision] using vision extraction: {reason}")
+            vision_text = extract_pdf_markdown(temp_path)
+            # Only trust vision output if it's substantive (guards against a bad call).
+            if vision_text and len(vision_text.strip()) >= max(100, len(text.strip()) * 0.5):
+                return vision_text, meta_title
+            print("[pdf-vision] vision output too short — keeping pypdf text")
+    except Exception as e:
+        print(f"[pdf-vision] fallback to pypdf ({e})")
+
+    return text, meta_title
+
+
 def _embed_in_background(doc_id: str, client_id: str, filename: str, extracted_text: str):
     """Run RAG chunking + embedding in a background thread so the HTTP response
     is not blocked by the (potentially slow) embedding step."""
@@ -648,13 +680,7 @@ def process_documents():
             meta_title = None
             try:
                 if file_ext == 'pdf':
-                    from pypdf import PdfReader
-                    reader = PdfReader(temp_path)
-                    meta_title = reader.metadata.title if reader.metadata else None
-                    for page in reader.pages:
-                        page_text = page.extract_text()
-                        if page_text:
-                            extracted_text += page_text + '\n'
+                    extracted_text, meta_title = _extract_pdf_smart(temp_path)
                 elif file_ext in ['docx', 'doc']:
                     from docx import Document
                     doc = Document(temp_path)
@@ -750,13 +776,7 @@ def process_documents():
             meta_title = None
             try:
                 if file_ext == 'pdf':
-                    from pypdf import PdfReader
-                    reader = PdfReader(temp_path)
-                    meta_title = reader.metadata.title if reader.metadata else None
-                    for page in reader.pages:
-                        page_text = page.extract_text()
-                        if page_text:
-                            extracted_text += page_text + '\n'
+                    extracted_text, meta_title = _extract_pdf_smart(temp_path)
 
                 elif file_ext in ['docx', 'doc']:
                     from docx import Document
