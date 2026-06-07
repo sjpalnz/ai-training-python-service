@@ -2708,10 +2708,55 @@ def generate_scorm_from_video():
         return jsonify({'error': str(e)}), 500
 
 
+_SEARCH_STOPWORDS = {
+    'what', 'which', 'when', 'where', 'how', 'why', 'is', 'are', 'am', 'the', 'a', 'an',
+    'for', 'to', 'of', 'do', 'does', 'did', 'i', 'you', 'we', 'my', 'me', 'your', 'need',
+    'needs', 'needed', 'require', 'required', 'requires', 'with', 'in', 'on', 'and', 'or',
+    'at', 'be', 'can', 'should', 'must', 'this', 'that', 'these', 'those', 'work', 'working',
+    'use', 'using', 'about', 'as', 'if', 'from', 'into', 'per', 'any', 'all', 'will',
+}
+
+
+def _salient_terms(question, max_terms=6):
+    """Distinctive query terms, longest (rarest) first, for keyword matching."""
+    import re
+    seen, uniq = set(), []
+    for t in re.findall(r'[a-z0-9]+', (question or '').lower()):
+        if len(t) >= 3 and t not in _SEARCH_STOPWORDS and t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    uniq.sort(key=len, reverse=True)
+    return uniq[:max_terms]
+
+
+def _keyword_chunks(supabase, terms, client_id, document_ids, per_term=4, total=10):
+    """Chunks literally containing the query's distinctive terms (rarest first),
+    so exact-match table rows surface even when they rank poorly semantically."""
+    out, seen = [], set()
+    for t in terms:
+        q = (supabase.table('document_chunks')
+             .select('id, document_id, chunk_index, chunk_text')
+             .eq('client_id', client_id))
+        if document_ids:
+            q = q.in_('document_id', document_ids)
+        rows = q.ilike('chunk_text', f'%{t}%').limit(per_term).execute().data or []
+        for c in rows:
+            key = (c.get('chunk_text') or '').strip()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(c)
+                if len(out) >= total:
+                    return out
+    return out
+
+
 @app.route('/search-chunks', methods=['POST'])
 def search_chunks():
     """
-    Embed a question and return the top-k most semantically similar document chunks.
+    Return document chunks relevant to a question, using HYBRID retrieval:
+    semantic top-k (vector similarity) merged with keyword matches on the
+    question's distinctive terms — so matrix/table rows (which embed weakly for
+    natural-language questions) still surface alongside prose.
 
     Expected JSON:
       {
@@ -2743,8 +2788,26 @@ def search_chunks():
             'match_client_id': client_id,
             'match_count': top_k,
         }).execute()
+        semantic = result.data or []
 
-        return jsonify({'success': True, 'chunks': result.data or []})
+        # Keyword pass — guarantees exact-term chunks (e.g. a "Acidified Ore"
+        # matrix row) are included even if semantic ranking buries them.
+        try:
+            kw = _keyword_chunks(supabase, _salient_terms(question), client_id, document_ids,
+                                 per_term=4, total=max(top_k, 10))
+        except Exception as ke:
+            print(f"[search-chunks] keyword pass failed (continuing semantic-only): {ke}")
+            kw = []
+
+        # Merge, de-dupe by chunk text, semantic first.
+        merged, seen = [], set()
+        for c in semantic + kw:
+            key = (c.get('chunk_text') or '').strip()
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(c)
+
+        return jsonify({'success': True, 'chunks': merged})
 
     except Exception as e:
         print(f"[search-chunks] Error: {e}")
