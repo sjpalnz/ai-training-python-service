@@ -8,13 +8,16 @@ yield no text at all. This module renders such pages to images and asks Claude
 to transcribe them to Markdown, preserving tables so row<->column relationships
 survive into the RAG index.
 
-It is used as a *fallback* from the normal pypdf path, gated by should_use_vision()
-so ordinary text PDFs are untouched (no added cost/latency).
+Gated by should_use_vision() so ordinary text PDFs are untouched. Rendering is
+done with poppler's `pdftoppm` one tile (crop region) at a time, so peak memory
+stays at roughly a single tile — no full-page raster is ever held in process.
+This runs in a background thread (see api.py), never in the upload request.
 """
 import base64
 import gc
-import io
 import os
+import subprocess
+import tempfile
 
 import requests as http_requests
 
@@ -29,14 +32,11 @@ MIN_CHARS_PER_PAGE = 60      # below this average → likely scanned/image
 MAX_VISION_PAGES = 20        # cost guard: don't vision huge documents
 
 # ── Tiling / rendering ───────────────────────────────────────────────────────
-# Kept deliberately modest: extraction runs inside the web request, so a smaller
-# image set keeps the Claude call well under the gunicorn worker timeout and the
-# container memory budget.
-DEFAULT_DPI = 120
-MAX_EDGE = 1400             # max tile edge in px (Claude reads these well)
+DEFAULT_DPI = 130
+MAX_EDGE = 1400              # max tile edge in px (Claude reads these well)
 TILE_OVERLAP = 120
 MAX_TILES_PER_PAGE = 16
-OVERVIEW_EDGE = 1300        # downscaled whole-page image for layout reference
+OVERVIEW_EDGE = 1300        # long edge (px) of the low-res whole-page overview
 
 
 def _page_sizes(pdf_path):
@@ -72,39 +72,45 @@ def should_use_vision(pdf_path, pypdf_text):
     return False, 'plain text sufficient'
 
 
-def _resize_to_edge(img, max_edge):
-    w, h = img.size
-    if max(w, h) <= max_edge:
-        return img
-    scale = max_edge / float(max(w, h))
-    return img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+def _pdftoppm(pdf_path, page, dpi, crop=None):
+    """Render one page (or a crop region) to PNG bytes via poppler pdftoppm.
+    crop = (x, y, w, h) in pixels at the given dpi. Low, bounded memory."""
+    with tempfile.TemporaryDirectory() as d:
+        prefix = os.path.join(d, 'out')
+        cmd = ['pdftoppm', '-png', '-singlefile', '-r', str(int(round(dpi))),
+               '-f', str(page), '-l', str(page)]
+        if crop:
+            x, y, w, h = crop
+            cmd += ['-x', str(int(x)), '-y', str(int(y)), '-W', str(int(w)), '-H', str(int(h))]
+        cmd += [pdf_path, prefix]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+        with open(prefix + '.png', 'rb') as f:
+            return f.read()
 
 
-def _tile_image(img):
-    """Split an image into overlapping tiles each <= MAX_EDGE px."""
-    w, h = img.size
-    if max(w, h) <= MAX_EDGE:
-        return [img]
+def _tile_regions(px_w, px_h):
+    """Return [(x, y, w, h)] px tiles each <= MAX_EDGE, with overlap."""
+    px_w, px_h = int(px_w), int(px_h)
+    if max(px_w, px_h) <= MAX_EDGE:
+        return [(0, 0, px_w, px_h)]
     step = MAX_EDGE - TILE_OVERLAP
-    tiles = []
+    regions = []
     y = 0
     while True:
         x = 0
         while True:
-            tiles.append(img.crop((x, y, min(x + MAX_EDGE, w), min(y + MAX_EDGE, h))))
-            if x + MAX_EDGE >= w:
+            regions.append((x, y, min(MAX_EDGE, px_w - x), min(MAX_EDGE, px_h - y)))
+            if x + MAX_EDGE >= px_w:
                 break
             x += step
-        if y + MAX_EDGE >= h:
+        if y + MAX_EDGE >= px_h:
             break
         y += step
-    return tiles
+    return regions
 
 
-def _img_to_b64(img):
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    return base64.standard_b64encode(buf.getvalue()).decode('ascii')
+def _b64(data):
+    return base64.standard_b64encode(data).decode('ascii')
 
 
 _PROMPT = (
@@ -139,55 +145,37 @@ def _transcribe(b64_images, api_key):
     return '\n'.join(parts).strip()
 
 
-def _page_to_b64_images(page):
-    """Build the base64 image set for one page, freeing PIL objects as we go to
-    keep peak memory low. Returns a list of base64 PNG strings."""
-    tiles = _tile_image(page)
-    if len(tiles) > MAX_TILES_PER_PAGE:
-        scale = (MAX_TILES_PER_PAGE / float(len(tiles))) ** 0.5
-        smaller = page.resize((max(1, int(page.size[0] * scale)), max(1, int(page.size[1] * scale))))
-        for t in tiles:
-            t.close()
-        tiles = _tile_image(smaller)
-        page = smaller
-
-    if len(tiles) > 1:
-        # Prepend a downscaled overview to aid reconstruction of the tiled page.
-        overview = _resize_to_edge(page, OVERVIEW_EDGE)
-        b64 = [_img_to_b64(overview)]
-        overview.close()
-        for t in tiles:
-            b64.append(_img_to_b64(t))
-            t.close()
-    else:
-        b64 = [_img_to_b64(tiles[0])]
-        tiles[0].close()
-    return b64
-
-
 def extract_pdf_markdown(pdf_path, api_key=None):
-    """Render the PDF and transcribe each page to Markdown via Claude. Raises on hard failure.
-    Renders one page at a time to bound peak memory."""
+    """Render the PDF (tile-by-tile via pdftoppm) and transcribe each page to
+    Markdown via Claude. Raises on hard failure. Memory stays ~one tile."""
     api_key = api_key or os.environ.get('ANTHROPIC_API_KEY')
     if not api_key:
         raise RuntimeError('ANTHROPIC_API_KEY not set')
 
-    from pdf2image import convert_from_path, pdfinfo_from_path
-    try:
-        num_pages = int(pdfinfo_from_path(pdf_path).get('Pages', 1))
-    except Exception:
-        num_pages = 1
-    num_pages = min(num_pages, MAX_VISION_PAGES)
+    sizes = _page_sizes(pdf_path)
+    num_pages = min(len(sizes) or 1, MAX_VISION_PAGES)
 
     out = []
     for i in range(1, num_pages + 1):
-        rendered = convert_from_path(pdf_path, dpi=DEFAULT_DPI, first_page=i, last_page=i)
-        page = rendered[0]
-        b64_images = _page_to_b64_images(page)
-        page.close()
-        gc.collect()
-        md = _transcribe(b64_images, api_key)
-        del b64_images
+        w_pt, h_pt = sizes[i - 1] if i - 1 < len(sizes) else (612.0, 792.0)
+        dpi = float(DEFAULT_DPI)
+        regions = _tile_regions(w_pt / 72.0 * dpi, h_pt / 72.0 * dpi)
+        # Lower the render dpi until the page fits the tile budget (grid rounding
+        # means one scale step isn't always enough — iterate to convergence).
+        while len(regions) > MAX_TILES_PER_PAGE and dpi > 40.0:
+            dpi = max(40.0, dpi * (MAX_TILES_PER_PAGE / float(len(regions))) ** 0.5 * 0.97)
+            regions = _tile_regions(w_pt / 72.0 * dpi, h_pt / 72.0 * dpi)
+
+        images_b64 = []
+        if len(regions) > 1:
+            ov_dpi = max(10.0, OVERVIEW_EDGE / (max(w_pt, h_pt) / 72.0))
+            images_b64.append(_b64(_pdftoppm(pdf_path, i, ov_dpi)))
+        for (x, y, w, h) in regions:
+            images_b64.append(_b64(_pdftoppm(pdf_path, i, dpi, crop=(x, y, w, h))))
+            gc.collect()
+
+        md = _transcribe(images_b64, api_key)
+        del images_b64
         gc.collect()
         if md:
             out.append(md)

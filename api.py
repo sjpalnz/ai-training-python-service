@@ -38,13 +38,10 @@ OUTPUT_DIR = '/tmp/generated_files'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def _extract_pdf_smart(temp_path):
-    """
-    Extract text from a PDF. Uses pypdf for ordinary documents, but falls back to
-    Claude vision transcription for matrix/spreadsheet or scanned PDFs whose layout
-    pypdf flattens (which breaks row<->column relationships in the RAG index).
-    Returns (text, meta_title).
-    """
+def _extract_pdf_pypdf(temp_path):
+    """Fast, synchronous text extraction from a PDF via pypdf. Returns
+    (text, meta_title). Used on the upload request path; richer vision
+    extraction for matrix/scanned PDFs happens later in the background."""
     from pypdf import PdfReader
     reader = PdfReader(temp_path)
     meta_title = reader.metadata.title if reader.metadata else None
@@ -53,40 +50,61 @@ def _extract_pdf_smart(temp_path):
         page_text = page.extract_text()
         if page_text:
             text += page_text + '\n'
-
-    try:
-        from pdf_vision import should_use_vision, extract_pdf_markdown
-        use, reason = should_use_vision(temp_path, text)
-        if use:
-            print(f"[pdf-vision] using vision extraction: {reason}")
-            vision_text = extract_pdf_markdown(temp_path)
-            # Only trust vision output if it's substantive (guards against a bad call).
-            if vision_text and len(vision_text.strip()) >= max(100, len(text.strip()) * 0.5):
-                return vision_text, meta_title
-            print("[pdf-vision] vision output too short — keeping pypdf text")
-    except Exception as e:
-        print(f"[pdf-vision] fallback to pypdf ({e})")
-
     return text, meta_title
 
 
-def _embed_in_background(doc_id: str, client_id: str, filename: str, extracted_text: str):
-    """Run RAG chunking + embedding in a background thread so the HTTP response
-    is not blocked by the (potentially slow) embedding step."""
+def _embed_document(doc_id: str, client_id: str, filename: str, extracted_text: str):
+    """(Re)chunk + embed a document's text into document_chunks."""
+    from embeddings import embed_texts, chunk_text
+    supabase = get_supabase_client()
+    supabase.table('document_chunks').delete().eq('document_id', doc_id).execute()
+    chunks = chunk_text(extracted_text)
+    embeddings = embed_texts(chunks)
+    chunk_rows = [
+        {'document_id': doc_id, 'client_id': client_id, 'chunk_index': i,
+         'chunk_text': c, 'embedding': e}
+        for i, (c, e) in enumerate(zip(chunks, embeddings))
+    ]
+    for batch_start in range(0, len(chunk_rows), 100):
+        supabase.table('document_chunks').insert(chunk_rows[batch_start:batch_start + 100]).execute()
+    print(f"[RAG] {len(chunks)} chunks indexed for {filename}")
+
+
+def _process_document_background(doc_id, client_id, filename, file_ext, file_bytes, base_text):
+    """
+    Background worker (runs OFF the upload request). For matrix/scanned PDFs it
+    upgrades the stored text via Claude vision (memory-bounded), then chunks +
+    embeds the final text. Any failure leaves the doc on its pypdf text, so the
+    upload itself is never affected.
+    """
+    final_text = base_text
     try:
-        from embeddings import embed_texts, chunk_text
-        supabase = get_supabase_client()
-        supabase.table('document_chunks').delete().eq('document_id', doc_id).execute()
-        chunks = chunk_text(extracted_text)
-        embeddings = embed_texts(chunks)
-        chunk_rows = [
-            {'document_id': doc_id, 'client_id': client_id, 'chunk_index': i,
-             'chunk_text': c, 'embedding': e}
-            for i, (c, e) in enumerate(zip(chunks, embeddings))
-        ]
-        for batch_start in range(0, len(chunk_rows), 100):
-            supabase.table('document_chunks').insert(chunk_rows[batch_start:batch_start + 100]).execute()
-        print(f"[RAG] {len(chunks)} chunks indexed for {filename}")
+        if file_ext == 'pdf' and file_bytes:
+            from pdf_vision import should_use_vision, extract_pdf_markdown
+            tmp = os.path.join('/tmp', f"vision_{doc_id}.pdf")
+            try:
+                with open(tmp, 'wb') as f:
+                    f.write(file_bytes)
+                use, reason = should_use_vision(tmp, base_text)
+                if use:
+                    print(f"[pdf-vision] {filename}: vision extraction ({reason})")
+                    vision_text = extract_pdf_markdown(tmp)
+                    if vision_text and len(vision_text.strip()) >= max(100, len(base_text.strip()) * 0.5):
+                        final_text = vision_text
+                        get_supabase_client().table('documents').update(
+                            {'extracted_text': final_text}
+                        ).eq('id', doc_id).execute()
+                        print(f"[pdf-vision] {filename}: upgraded extracted_text ({len(final_text)} chars)")
+                    else:
+                        print(f"[pdf-vision] {filename}: vision output too short — keeping pypdf text")
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+    except Exception as e:
+        print(f"[pdf-vision] {filename}: vision failed, keeping pypdf text ({e})")
+
+    try:
+        _embed_document(doc_id, client_id, filename, final_text)
     except Exception as embed_err:
         print(f"[RAG] Warning: could not index chunks for {filename}: {embed_err}")
 
@@ -680,7 +698,7 @@ def process_documents():
             meta_title = None
             try:
                 if file_ext == 'pdf':
-                    extracted_text, meta_title = _extract_pdf_smart(temp_path)
+                    extracted_text, meta_title = _extract_pdf_pypdf(temp_path)
                 elif file_ext in ['docx', 'doc']:
                     from docx import Document
                     doc = Document(temp_path)
@@ -722,11 +740,13 @@ def process_documents():
                 'p_reference_id': None
             }).execute()
 
-            # RAG chunking — run in background so HTTP response is not delayed
+            # Vision upgrade (matrix/scanned PDFs) + RAG embedding — run in the
+            # background so the HTTP response is immediate and never times out.
             doc_id = insert_result.data[0]['id']
             threading.Thread(
-                target=_embed_in_background,
-                args=(doc_id, client_id, filename, extracted_text),
+                target=_process_document_background,
+                args=(doc_id, client_id, filename, file_ext,
+                      file_content if file_ext == 'pdf' else None, extracted_text),
                 daemon=True
             ).start()
 
@@ -771,12 +791,16 @@ def process_documents():
                 os.remove(temp_path)
                 return jsonify({'error': f'{filename} exceeds 10MB limit'}), 400
 
-            # Extract text based on file type
+            # Extract text based on file type (pypdf is fast/synchronous; richer
+            # vision extraction for matrix/scanned PDFs runs later in the background)
             extracted_text = ''
             meta_title = None
+            file_bytes = None
             try:
                 if file_ext == 'pdf':
-                    extracted_text, meta_title = _extract_pdf_smart(temp_path)
+                    extracted_text, meta_title = _extract_pdf_pypdf(temp_path)
+                    with open(temp_path, 'rb') as fb:
+                        file_bytes = fb.read()
 
                 elif file_ext in ['docx', 'doc']:
                     from docx import Document
@@ -817,39 +841,14 @@ def process_documents():
                 'file_size': file_size
             }).execute()
 
-            # ── RAG: chunk + embed the document ──────────────────────────────
-            try:
-                from embeddings import embed_texts, chunk_text
-                doc_id = insert_result.data[0]['id']
-
-                # Remove any stale chunks for this document
-                supabase.table('document_chunks').delete().eq('document_id', doc_id).execute()
-
-                # Split into overlapping passages and generate embeddings
-                chunks = chunk_text(extracted_text)
-                embeddings = embed_texts(chunks)
-
-                chunk_rows = [
-                    {
-                        'document_id': doc_id,
-                        'client_id': client_id,
-                        'chunk_index': i,
-                        'chunk_text': c,
-                        'embedding': e,
-                    }
-                    for i, (c, e) in enumerate(zip(chunks, embeddings))
-                ]
-
-                # Insert in batches of 100 to stay within request size limits
-                for batch_start in range(0, len(chunk_rows), 100):
-                    supabase.table('document_chunks').insert(
-                        chunk_rows[batch_start:batch_start + 100]
-                    ).execute()
-
-                print(f"[RAG] {len(chunks)} chunks indexed for {filename}")
-            except Exception as embed_err:
-                # Non-fatal: Q&A falls back to full-text if chunks are missing
-                print(f"[RAG] Warning: could not index chunks for {filename}: {embed_err}")
+            # ── RAG + vision upgrade: run OFF the request in a background thread
+            # so the upload returns immediately and never blocks/times out ──────
+            doc_id = insert_result.data[0]['id']
+            threading.Thread(
+                target=_process_document_background,
+                args=(doc_id, client_id, filename, file_ext, file_bytes, extracted_text),
+                daemon=True
+            ).start()
 
             processed.append({
                 'filename': filename,
