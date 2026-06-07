@@ -12,6 +12,7 @@ It is used as a *fallback* from the normal pypdf path, gated by should_use_visio
 so ordinary text PDFs are untouched (no added cost/latency).
 """
 import base64
+import gc
 import io
 import os
 
@@ -28,11 +29,14 @@ MIN_CHARS_PER_PAGE = 60      # below this average → likely scanned/image
 MAX_VISION_PAGES = 20        # cost guard: don't vision huge documents
 
 # ── Tiling / rendering ───────────────────────────────────────────────────────
-DEFAULT_DPI = 150
-MAX_EDGE = 1500              # max tile edge in px (Claude reads these well)
+# Kept deliberately modest: extraction runs inside the web request, so a smaller
+# image set keeps the Claude call well under the gunicorn worker timeout and the
+# container memory budget.
+DEFAULT_DPI = 120
+MAX_EDGE = 1400             # max tile edge in px (Claude reads these well)
 TILE_OVERLAP = 120
-MAX_TILES_PER_PAGE = 30
-OVERVIEW_EDGE = 1400         # downscaled whole-page image for layout reference
+MAX_TILES_PER_PAGE = 16
+OVERVIEW_EDGE = 1300        # downscaled whole-page image for layout reference
 
 
 def _page_sizes(pdf_path):
@@ -116,12 +120,12 @@ _PROMPT = (
 )
 
 
-def _transcribe(images, api_key):
+def _transcribe(b64_images, api_key):
     content = [{'type': 'text', 'text': _PROMPT}]
-    for im in images:
+    for data in b64_images:
         content.append({
             'type': 'image',
-            'source': {'type': 'base64', 'media_type': 'image/png', 'data': _img_to_b64(im)},
+            'source': {'type': 'base64', 'media_type': 'image/png', 'data': data},
         })
     resp = http_requests.post(
         ANTHROPIC_URL,
@@ -135,28 +139,56 @@ def _transcribe(images, api_key):
     return '\n'.join(parts).strip()
 
 
+def _page_to_b64_images(page):
+    """Build the base64 image set for one page, freeing PIL objects as we go to
+    keep peak memory low. Returns a list of base64 PNG strings."""
+    tiles = _tile_image(page)
+    if len(tiles) > MAX_TILES_PER_PAGE:
+        scale = (MAX_TILES_PER_PAGE / float(len(tiles))) ** 0.5
+        smaller = page.resize((max(1, int(page.size[0] * scale)), max(1, int(page.size[1] * scale))))
+        for t in tiles:
+            t.close()
+        tiles = _tile_image(smaller)
+        page = smaller
+
+    if len(tiles) > 1:
+        # Prepend a downscaled overview to aid reconstruction of the tiled page.
+        overview = _resize_to_edge(page, OVERVIEW_EDGE)
+        b64 = [_img_to_b64(overview)]
+        overview.close()
+        for t in tiles:
+            b64.append(_img_to_b64(t))
+            t.close()
+    else:
+        b64 = [_img_to_b64(tiles[0])]
+        tiles[0].close()
+    return b64
+
+
 def extract_pdf_markdown(pdf_path, api_key=None):
-    """Render the PDF and transcribe each page to Markdown via Claude. Raises on hard failure."""
+    """Render the PDF and transcribe each page to Markdown via Claude. Raises on hard failure.
+    Renders one page at a time to bound peak memory."""
     api_key = api_key or os.environ.get('ANTHROPIC_API_KEY')
     if not api_key:
         raise RuntimeError('ANTHROPIC_API_KEY not set')
 
-    from pdf2image import convert_from_path
-    pages = convert_from_path(pdf_path, dpi=DEFAULT_DPI)
-    if len(pages) > MAX_VISION_PAGES:
-        pages = pages[:MAX_VISION_PAGES]
+    from pdf2image import convert_from_path, pdfinfo_from_path
+    try:
+        num_pages = int(pdfinfo_from_path(pdf_path).get('Pages', 1))
+    except Exception:
+        num_pages = 1
+    num_pages = min(num_pages, MAX_VISION_PAGES)
 
     out = []
-    for page in pages:
-        tiles = _tile_image(page)
-        if len(tiles) > MAX_TILES_PER_PAGE:
-            # Too many tiles → downscale the whole page so it fits the budget.
-            scale = (MAX_TILES_PER_PAGE / float(len(tiles))) ** 0.5
-            page = page.resize((max(1, int(page.size[0] * scale)), max(1, int(page.size[1] * scale))))
-            tiles = _tile_image(page)
-        # Prepend a downscaled overview when the page was tiled, to aid reconstruction.
-        images = ([_resize_to_edge(page, OVERVIEW_EDGE)] + tiles) if len(tiles) > 1 else tiles
-        md = _transcribe(images, api_key)
+    for i in range(1, num_pages + 1):
+        rendered = convert_from_path(pdf_path, dpi=DEFAULT_DPI, first_page=i, last_page=i)
+        page = rendered[0]
+        b64_images = _page_to_b64_images(page)
+        page.close()
+        gc.collect()
+        md = _transcribe(b64_images, api_key)
+        del b64_images
+        gc.collect()
         if md:
             out.append(md)
     return '\n\n---\n\n'.join(out).strip()
