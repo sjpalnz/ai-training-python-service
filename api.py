@@ -1961,19 +1961,23 @@ def _tts_session_get(sid):
         return _TTS_SESSIONS.get(sid)
 
 
-def _chunk_for_tts(text, target=180, max_chars=400):
-    """Split text into ~sentence-sized chunks. First chunk small so audio starts fast."""
+def _chunk_for_tts(text, target=180, max_chars=400, first_chunk_max=90):
+    """Split text into ~sentence-sized chunks. The FIRST chunk is kept very small
+    (first_chunk_max) so playback starts as fast as possible — important for slower
+    custom/Qwen voices — while later chunks are larger for efficiency."""
     import re
     sents = [s for s in re.split(r'(?<=[.!?…])\s+', (text or '').strip()) if s]
     chunks, buf = [], ''
     for s in sents:
+        # Flush sooner while we still owe the small first chunk.
+        cur_target = first_chunk_max if not chunks else target
         if not buf:
             buf = s
         elif len(buf) + 1 + len(s) <= max_chars:
             buf = f"{buf} {s}"
         else:
             chunks.append(buf); buf = s
-        if len(buf) >= target:
+        if len(buf) >= cur_target:
             chunks.append(buf); buf = ''
     if buf:
         chunks.append(buf)
@@ -2073,6 +2077,15 @@ def tts_start():
         if not chunks:
             return jsonify({'error': 'no synthesizable text'}), 400
         sid = _tts_session_create(chunks, voice_id, provider)
+        # Warm the cache for the first chunk(s) in the background so the client's
+        # GET /tts-chunk/0 returns immediately instead of synthesizing on demand.
+        def _prefetch(chs, vid, prov, n=2):
+            for i in range(min(n, len(chs))):
+                try:
+                    _tts_mp3_bytes_cached(chs[i], vid, prov)
+                except Exception as pe:
+                    print(f"[tts-prefetch] chunk {i} failed: {pe}")
+        threading.Thread(target=_prefetch, args=(chunks, voice_id, provider), daemon=True).start()
         return jsonify({'session_id': sid, 'chunks': len(chunks)})
     except Exception as e:
         print(f"[tts-start] Error: {e}")
