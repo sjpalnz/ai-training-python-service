@@ -1,6 +1,6 @@
-# TruSource — AI Training Platform (Python Service)
+# DocSmarty — AI Training Platform (Python Service)
 
-This is the backend processing service for TruSource. It handles all the heavy-lifting tasks that require file generation, media processing, and document analysis — things that can't run in serverless edge functions.
+This is the backend processing service for DocSmarty. It handles all the heavy-lifting tasks that require file generation, media processing, and document analysis — things that can't run in serverless edge functions.
 
 ## What This Service Does
 
