@@ -141,7 +141,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
         prs = Presentation()
         apply_bg = True
 
-    prs.slide_width  = Inches(10)
+    prs.slide_width  = Inches(13.333)
     prs.slide_height = Inches(7.5)
 
     heading_color = theme['heading_color']
@@ -164,7 +164,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 slide,
                 text   = slide_data.get('content', course_data.get('title', 'Training Course')),
                 left   = Inches(0.5), top    = Inches(2.0),
-                width  = Inches(9),   height = Inches(2),
+                width  = Inches(12.333),   height = Inches(2),
                 size   = title_size,  bold   = True,
                 color  = heading_color, align = PP_ALIGN.CENTER,
             )
@@ -175,7 +175,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                     slide,
                     text   = subtitle,
                     left   = Inches(0.5), top    = Inches(4.2),
-                    width  = Inches(9),   height = Inches(0.8),
+                    width  = Inches(12.333),   height = Inches(0.8),
                     size   = Pt(22),      bold   = False,
                     color  = accent_color, align = PP_ALIGN.CENTER,
                 )
@@ -185,7 +185,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 slide,
                 text   = slide_data.get('title', 'Learning Objectives'),
                 left   = Inches(0.5), top    = Inches(0.5),
-                width  = Inches(9),   height = Inches(0.9),
+                width  = Inches(12.333),   height = Inches(0.9),
                 size   = heading_size, bold  = True,
                 color  = heading_color,
             )
@@ -193,7 +193,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 _add_bullets(
                     slide, slide_data['bullets'],
                     left = Inches(1), top    = Inches(1.6),
-                    width = Inches(8), height = Inches(5.5),
+                    width = Inches(11.333), height = Inches(5.5),
                     size = body_size, color  = text_color,
                 )
 
@@ -202,7 +202,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 slide,
                 text   = slide_data.get('title', 'Content'),
                 left   = Inches(0.5), top    = Inches(0.5),
-                width  = Inches(9),   height = Inches(0.9),
+                width  = Inches(12.333),   height = Inches(0.9),
                 size   = heading_size, bold  = True,
                 color  = heading_color,
             )
@@ -210,7 +210,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 _add_bullets(
                     slide, slide_data['bullets'],
                     left = Inches(1), top    = Inches(1.6),
-                    width = Inches(8), height = Inches(5.5),
+                    width = Inches(11.333), height = Inches(5.5),
                     size = body_size, color  = text_color,
                 )
             elif slide_data.get('content'):
@@ -218,7 +218,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                     slide,
                     text   = slide_data['content'],
                     left   = Inches(0.5), top    = Inches(1.6),
-                    width  = Inches(9),   height = Inches(5.5),
+                    width  = Inches(12.333),   height = Inches(5.5),
                     size   = body_size,   bold   = False,
                     color  = text_color,
                 )
@@ -228,7 +228,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 slide,
                 text   = slide_data.get('title', 'Knowledge Check'),
                 left   = Inches(0.5), top    = Inches(0.4),
-                width  = Inches(9),   height = Inches(0.8),
+                width  = Inches(12.333),   height = Inches(0.8),
                 size   = Pt(28),      bold   = True,
                 color  = heading_color,
             )
@@ -237,7 +237,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                     slide,
                     text   = slide_data['question'],
                     left   = Inches(0.5), top    = Inches(1.3),
-                    width  = Inches(9),   height = Inches(1.0),
+                    width  = Inches(12.333),   height = Inches(1.0),
                     size   = Pt(20),      bold   = True,
                     color  = text_color,
                 )
@@ -245,7 +245,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 _add_bullets(
                     slide, slide_data['options'],
                     left = Inches(1), top    = Inches(2.5),
-                    width = Inches(8), height = Inches(4.5),
+                    width = Inches(11.333), height = Inches(4.5),
                     size = body_size, color  = text_color,
                 )
 
@@ -254,7 +254,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 slide,
                 text   = slide_data.get('title', 'Knowledge Check'),
                 left   = Inches(0.5), top    = Inches(2.5),
-                width  = Inches(9),   height = Inches(2),
+                width  = Inches(12.333),   height = Inches(2),
                 size   = title_size,  bold   = True,
                 color  = heading_color, align = PP_ALIGN.CENTER,
             )
@@ -264,7 +264,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 slide,
                 text   = slide_data.get('title', 'Answer'),
                 left   = Inches(0.5), top    = Inches(0.4),
-                width  = Inches(9),   height = Inches(0.8),
+                width  = Inches(12.333),   height = Inches(0.8),
                 size   = Pt(28),      bold   = True,
                 color  = heading_color,
             )
@@ -274,7 +274,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                     slide,
                     text   = f'Correct: {answer_text}',
                     left   = Inches(0.5), top    = Inches(1.5),
-                    width  = Inches(9),   height = Inches(0.8),
+                    width  = Inches(12.333),   height = Inches(0.8),
                     size   = Pt(22),      bold   = True,
                     color  = accent_color,
                 )
@@ -283,7 +283,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                     slide,
                     text   = slide_data['explanation'],
                     left   = Inches(0.5), top    = Inches(2.8),
-                    width  = Inches(9),   height = Inches(4),
+                    width  = Inches(12.333),   height = Inches(4),
                     size   = body_size,   bold   = False,
                     color  = text_color,
                 )
@@ -314,7 +314,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 _add_title_box(
                     slide,
                     text   = f'⏱  {dur_mins} min',
-                    left   = Inches(7.5), top    = Inches(0.35),
+                    left   = Inches(10.833), top    = Inches(0.35),
                     width  = Inches(2),   height = Inches(0.55),
                     size   = Pt(13),      bold   = False,
                     color  = RGBColor(100, 100, 100),
@@ -326,7 +326,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 slide,
                 text   = slide_data.get('title', 'Activity'),
                 left   = Inches(0.5), top    = Inches(1.0),
-                width  = Inches(9),   height = Inches(0.9),
+                width  = Inches(12.333),   height = Inches(0.9),
                 size   = heading_size, bold  = True,
                 color  = heading_color,
             )
@@ -337,7 +337,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                     slide,
                     text   = slide_data['instructions'],
                     left   = Inches(0.5), top    = Inches(2.1),
-                    width  = Inches(9),   height = Inches(4.5),
+                    width  = Inches(12.333),   height = Inches(4.5),
                     size   = body_size,   bold   = False,
                     color  = text_color,
                 )
@@ -349,7 +349,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                     slide,
                     text   = materials_text,
                     left   = Inches(0.5), top    = Inches(6.6),
-                    width  = Inches(9),   height = Inches(0.6),
+                    width  = Inches(12.333),   height = Inches(0.6),
                     size   = Pt(13),      bold   = False,
                     color  = RGBColor(120, 120, 120),
                 )
@@ -359,7 +359,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 slide,
                 text   = slide_data.get('title', 'Key Takeaways'),
                 left   = Inches(0.5), top    = Inches(0.5),
-                width  = Inches(9),   height = Inches(0.9),
+                width  = Inches(12.333),   height = Inches(0.9),
                 size   = heading_size, bold  = True,
                 color  = heading_color,
             )
@@ -367,7 +367,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 _add_bullets(
                     slide, slide_data['bullets'],
                     left = Inches(1), top    = Inches(1.6),
-                    width = Inches(8), height = Inches(5.5),
+                    width = Inches(11.333), height = Inches(5.5),
                     size = body_size, color  = text_color,
                 )
 
@@ -377,7 +377,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                 slide,
                 text   = slide_data.get('title', ''),
                 left   = Inches(0.5), top    = Inches(0.5),
-                width  = Inches(9),   height = Inches(0.9),
+                width  = Inches(12.333),   height = Inches(0.9),
                 size   = heading_size, bold  = True,
                 color  = heading_color,
             )
@@ -386,7 +386,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
                     slide,
                     text   = slide_data['content'],
                     left   = Inches(0.5), top    = Inches(1.6),
-                    width  = Inches(9),   height = Inches(5.5),
+                    width  = Inches(12.333),   height = Inches(5.5),
                     size   = body_size,   bold   = False,
                     color  = text_color,
                 )
@@ -399,7 +399,7 @@ def generate_powerpoint_file(course_data, output_path, theme_id='corporate', tem
             slide,
             text   = 'Course Infographic',
             left   = Inches(0.5), top    = Inches(0.3),
-            width  = Inches(9),   height = Inches(0.6),
+            width  = Inches(12.333),   height = Inches(0.6),
             size   = Pt(24),      bold   = True,
             color  = heading_color, align = PP_ALIGN.CENTER,
         )

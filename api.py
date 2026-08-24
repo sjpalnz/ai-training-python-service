@@ -417,11 +417,20 @@ def generate_scorm_from_storyboard():
         except Exception as e:
             print(f"[SCORM] Warning: could not fetch media for embedding: {e}")
 
+        # Extract interactive quiz data from storyboard quiz slides
+        quiz_data = None
+        quiz_slides = [s for s in course_data.get('slides', []) if s.get('slide_type') == 'quiz' and s.get('question')]
+        if quiz_slides:
+            quiz_data = {
+                'questions': [{'question': s['question'], 'options': s.get('options', []), 'correct': s.get('correct_answer', 0)} for s in quiz_slides],
+                'pass_percentage': 70
+            }
+
         # Generate SCORM package
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"scorm_{storyboard_id[:8]}_{timestamp}.zip"
         filepath = os.path.join(OUTPUT_DIR, filename)
-        generate_scorm_package(course_data, filepath, podcast_url=podcast_url, infographic_url=infographic_url)
+        generate_scorm_package(course_data, filepath, podcast_url=podcast_url, infographic_url=infographic_url, quiz_data=quiz_data)
 
         # Upload to Supabase Storage
         storage_path = f"scorm/{filename}"
@@ -2504,7 +2513,7 @@ def _voiceover_video_job_worker(job_id, audio_zip_url, slide_image_urls, user_id
             'metadata': json.dumps({
                 'slide_count': len(mp3_files),
                 'duration_ms': total_duration_ms,
-                'resolution': '1920x1080',
+                'resolution': '1280x720',
             })
         }).execute()
 
@@ -2684,6 +2693,7 @@ def generate_scorm_from_video():
         title = data.get('title', 'Training Video')
         video_url = data.get('video_url')
         user_id = data.get('user_id')
+        quiz_data = data.get('quiz_data')
 
         if not video_url:
             return jsonify({'error': 'video_url is required'}), 400
@@ -2696,7 +2706,7 @@ def generate_scorm_from_video():
         filename = f"scorm_video_{timestamp}.zip"
         filepath = os.path.join(OUTPUT_DIR, filename)
 
-        generate_video_scorm_package(title, video_url, filepath)
+        generate_video_scorm_package(title, video_url, filepath, quiz_data=quiz_data)
 
         # Upload to Supabase Storage
         supabase = get_supabase_client()

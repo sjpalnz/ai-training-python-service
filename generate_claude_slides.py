@@ -99,7 +99,7 @@ def _generate_preview_images(course_data, output_dir, theme_id='corporate'):
     heading_rgb = to_rgb(theme.get('heading_color'), (30, 58, 95))
     text_rgb = to_rgb(theme.get('text_color'), (51, 51, 51))
 
-    W, H = 960, 720
+    W, H = 1280, 720
     paths = []
 
     for i, slide_data in enumerate(course_data.get('slides', [])):

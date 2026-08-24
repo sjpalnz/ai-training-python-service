@@ -291,8 +291,14 @@ def generate_html(course_data, podcast_url=None, infographic_url=None):
     <script>
         function completeCourse() {
             if (window.API) {
-                API.LMSSetValue("cmi.core.lesson_status", "completed");
-                API.LMSSetValue("cmi.core.score.raw", "100");
+                var existingScore = API.LMSGetValue("cmi.core.score.raw");
+                if (!existingScore) {
+                    API.LMSSetValue("cmi.core.score.raw", "100");
+                }
+                var existingStatus = API.LMSGetValue("cmi.core.lesson_status");
+                if (existingStatus !== "passed" && existingStatus !== "failed") {
+                    API.LMSSetValue("cmi.core.lesson_status", "completed");
+                }
                 API.LMSCommit("");
                 alert("Course completed successfully!");
             }
@@ -310,52 +316,64 @@ def generate_html(course_data, podcast_url=None, infographic_url=None):
     return html
 
 def generate_api_wrapper():
-    """Generate SCORM API wrapper JavaScript"""
-    return '''// SCORM 1.2 API Wrapper
-var API = {
-    LMSInitialize: function(param) {
-        console.log("LMSInitialize called");
-        return "true";
-    },
-    LMSFinish: function(param) {
-        console.log("LMSFinish called");
-        return "true";
-    },
-    LMSGetValue: function(element) {
-        console.log("LMSGetValue: " + element);
-        return "";
-    },
-    LMSSetValue: function(element, value) {
-        console.log("LMSSetValue: " + element + " = " + value);
-        return "true";
-    },
-    LMSCommit: function(param) {
-        console.log("LMSCommit called");
-        return "true";
-    },
-    LMSGetLastError: function() {
-        return "0";
-    },
-    LMSGetErrorString: function(errorCode) {
-        return "No error";
-    },
-    LMSGetDiagnostic: function(errorCode) {
-        return "No error";
-    }
-};
+    """Generate SCORM 1.2 API wrapper with standard findAPI() discovery."""
+    return '''// SCORM 1.2 API Wrapper — discovers the LMS-provided API object via the
+// standard parent/opener frame walk, falling back to a local stub for
+// out-of-LMS preview/testing.
 
-window.API = API;
+var _scormAPI = null;
+var _scormData = {};
+
+function findAPI(win) {
+  var attempts = 0;
+  while (win && !win.API && attempts < 10) {
+    attempts++;
+    win = win.parent && win.parent !== win ? win.parent : null;
+  }
+  return win ? win.API : null;
+}
+
+function getAPI() {
+  if (_scormAPI) return _scormAPI;
+  _scormAPI = findAPI(window);
+  if (!_scormAPI && window.opener) _scormAPI = findAPI(window.opener);
+  if (!_scormAPI) {
+    _scormAPI = {
+      LMSInitialize: function() { return "true"; },
+      LMSFinish: function() { return "true"; },
+      LMSGetValue: function(el) { return _scormData[el] || ""; },
+      LMSSetValue: function(el, val) { _scormData[el] = val; return "true"; },
+      LMSCommit: function() { return "true"; },
+      LMSGetLastError: function() { return "0"; },
+      LMSGetErrorString: function() { return "No error"; },
+      LMSGetDiagnostic: function() { return "No error"; }
+    };
+  }
+  return _scormAPI;
+}
+
+var API = {
+  LMSInitialize: function(p) { return getAPI().LMSInitialize(p); },
+  LMSFinish: function(p) { return getAPI().LMSFinish(p); },
+  LMSGetValue: function(el) { return getAPI().LMSGetValue(el); },
+  LMSSetValue: function(el, val) { return getAPI().LMSSetValue(el, val); },
+  LMSCommit: function(p) { return getAPI().LMSCommit(p); },
+  LMSGetLastError: function() { return getAPI().LMSGetLastError(); },
+  LMSGetErrorString: function(c) { return getAPI().LMSGetErrorString(c); },
+  LMSGetDiagnostic: function(c) { return getAPI().LMSGetDiagnostic(c); }
+};
 '''
 
 
-def generate_video_scorm_package(title, video_url, output_path):
+def generate_video_scorm_package(title, video_url, output_path, quiz_data=None):
     """
     Generate a SCORM 1.2 package that wraps an MP4 video.
 
     Args:
-        title:      Course title
-        video_url:  Public URL to the MP4 video file
+        title:       Course title
+        video_url:   Public URL to the MP4 video file
         output_path: Path where the .zip will be saved
+        quiz_data:   Optional dict with 'questions' list and 'pass_percentage'
     """
     temp_dir = '/tmp/scorm_video_temp'
     if os.path.exists(temp_dir):
@@ -378,7 +396,7 @@ def generate_video_scorm_package(title, video_url, output_path):
         f.write(manifest_content)
 
     # index.html
-    html_content = _video_html(title)
+    html_content = _video_html(title, quiz_data=quiz_data)
     with open(os.path.join(temp_dir, 'index.html'), 'w') as f:
         f.write(html_content)
 
@@ -445,8 +463,67 @@ def _video_manifest(title):
     return reparsed.toprettyxml(indent='  ')
 
 
-def _video_html(title):
-    """Generate HTML page that plays the embedded video."""
+def _video_html(title, quiz_data=None):
+    """Generate HTML page that plays the embedded video, with optional interactive quiz."""
+    import json as _json
+
+    quiz_section = ''
+    if quiz_data and quiz_data.get('questions'):
+        pass_pct = quiz_data.get('pass_percentage', 70)
+        quiz_json = _json.dumps(quiz_data['questions'])
+        quiz_section = f'''
+    <div id="quiz-section" style="width: 100%; max-width: 960px; margin-top: 32px; background: #1a1a2e; border-radius: 12px; padding: 28px; border: 1px solid #333;">
+        <h2 style="font-size: 18px; font-weight: 700; margin-bottom: 6px; color: #e0e0e0;">Knowledge Check</h2>
+        <p style="color: #888; margin-bottom: 20px; font-size: 14px;">Answer all questions below, then click Submit. Pass mark: {pass_pct}%</p>
+        <div id="quiz-container"></div>
+        <div id="quiz-result" style="display:none; padding: 20px; border-radius: 10px; margin-top: 20px; text-align: center;"></div>
+        <button id="quiz-submit" onclick="submitQuiz()" style="margin-top: 15px;">Submit Answers</button>
+    </div>
+    <script>
+    (function() {{{{
+        var questions = {quiz_json};
+        var passPercent = {pass_pct};
+        var container = document.getElementById('quiz-container');
+        questions.forEach(function(q, i) {{{{
+            var div = document.createElement('div');
+            div.style.cssText = 'margin-bottom: 16px; padding: 16px; background: #12121f; border-radius: 10px; border: 1px solid #333;';
+            var h = '<p style="font-weight: 600; margin-bottom: 10px; color: #e0e0e0;">' + (i+1) + '. ' + q.question + '</p>';
+            q.options.forEach(function(opt, j) {{{{
+                var letter = String.fromCharCode(65 + j);
+                h += '<label style="display: block; padding: 8px 12px; margin: 4px 0; border-radius: 6px; cursor: pointer; border: 1px solid #333; color: #ccc;">';
+                h += '<input type="radio" name="q' + i + '" value="' + j + '" style="margin-right: 8px;"> ' + letter + '. ' + opt;
+                h += '</label>';
+            }}}});
+            div.innerHTML = h;
+            container.appendChild(div);
+        }}}});
+        window.submitQuiz = function() {{{{
+            var score = 0, total = questions.length;
+            questions.forEach(function(q, i) {{{{
+                var sel = document.querySelector('input[name="q' + i + '"]:checked');
+                if (sel && parseInt(sel.value) === q.correct) score++;
+            }}}});
+            var pct = Math.round((score / total) * 100);
+            var passed = pct >= passPercent;
+            var result = document.getElementById('quiz-result');
+            result.style.display = 'block';
+            result.style.background = passed ? '#1a3a2a' : '#3a1a1a';
+            result.style.border = '2px solid ' + (passed ? '#22c55e' : '#ef4444');
+            result.innerHTML = '<h2 style="color: ' + (passed ? '#22c55e' : '#ef4444') + '; margin: 0 0 8px 0;">' + (passed ? 'PASSED' : 'NOT PASSED') + '</h2>'
+                + '<p style="font-size: 24px; font-weight: bold; margin: 0; color: #fff;">' + score + ' / ' + total + ' (' + pct + '%)</p>'
+                + '<p style="color: #888; margin: 8px 0 0 0;">Pass mark: ' + passPercent + '%</p>';
+            document.getElementById('quiz-submit').style.display = 'none';
+            if (window.API) {{{{
+                API.LMSSetValue("cmi.core.score.raw", String(pct));
+                API.LMSSetValue("cmi.core.lesson_status", passed ? "passed" : "failed");
+                API.LMSCommit("");
+            }}}}
+            var btn = document.getElementById('completeBtn');
+            if (btn) btn.textContent = passed ? 'Complete Course' : 'Finish (Not Passed)';
+        }}}};
+    }}}})();
+    </script>'''
+
     return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -464,8 +541,7 @@ def _video_html(title):
             display: flex;
             flex-direction: column;
             align-items: center;
-            justify-content: center;
-            padding: 20px;
+            padding: 40px 20px;
         }}
         h1 {{
             font-size: 20px;
@@ -525,6 +601,7 @@ def _video_html(title):
         <button id="completeBtn" onclick="completeCourse()">Mark as Complete</button>
         <p class="status" id="status"></p>
     </div>
+    {quiz_section}
 
     <script>
         // Initialize SCORM
@@ -535,13 +612,19 @@ def _video_html(title):
 
         var player = document.getElementById("player");
         player.addEventListener("ended", function() {{
-            document.getElementById("status").textContent = "Video finished. Click below to complete the course.";
+            document.getElementById("status").textContent = "Video finished.";
         }});
 
         function completeCourse() {{
             if (window.API) {{
-                API.LMSSetValue("cmi.core.lesson_status", "completed");
-                API.LMSSetValue("cmi.core.score.raw", "100");
+                var existingScore = API.LMSGetValue("cmi.core.score.raw");
+                if (!existingScore) {{
+                    API.LMSSetValue("cmi.core.score.raw", "100");
+                }}
+                var existingStatus = API.LMSGetValue("cmi.core.lesson_status");
+                if (existingStatus !== "passed" && existingStatus !== "failed") {{
+                    API.LMSSetValue("cmi.core.lesson_status", "completed");
+                }}
                 API.LMSCommit("");
             }}
             var btn = document.getElementById("completeBtn");
